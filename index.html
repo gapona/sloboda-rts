@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>СЛОБОДА</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700;800&display=swap" rel="stylesheet">
+    <style>
+      html, body { margin: 0; padding: 0; background: #050607; overflow: hidden; height: 100%; font-family: system-ui, sans-serif; color: #eee; }
+      #game { width: 100vw; height: 100vh; position: relative; z-index: 1; }
+      canvas { display: block; }
+      #menu-bg {
+        position: fixed;
+        inset: 0;
+        width: 100vw;
+        height: 100vh;
+        object-fit: cover;
+        z-index: 0;
+        pointer-events: none;
+        opacity: 0;
+        transition: opacity 0.8s ease;
+      }
+      #menu-bg.visible { opacity: 1; }
+      #game-over-screen:not(.visible) {
+        opacity: 0;
+        visibility: hidden;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <img id="menu-bg" alt="" />
+    <div id="game"></div>
+
+    <div id="menu-layer" style="display: none;">
+      <div id="menu-vignette"></div>
+      <div id="menu-card">
+        <div id="menu-brand">
+          <div id="menu-title">СЛОБОДА</div>
+          <div id="menu-subtitle">дике поле приймає тих, хто його тримає</div>
+          <div id="menu-lore">На старому городищі, де уривається Муравський шлях, перші слобожани ставлять хутір.</div>
+        </div>
+
+        <div class="menu-section">
+          <div class="menu-section-label">Режим</div>
+          <div class="menu-mode-row">
+            <div class="menu-mode-card active" aria-current="true">
+              <div class="menu-mode-name">Стычка 1×1</div>
+              <div class="menu-mode-tag">выберите фракцию ниже</div>
+            </div>
+            <div class="menu-mode-card">
+              <div class="menu-mode-name">Сюжетная карта</div>
+              <div class="menu-mode-tag">оберіть сценарій:</div>
+              <div class="menu-story-row" id="menu-story-row"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="menu-section">
+          <div class="menu-section-label">Фракция</div>
+          <div class="menu-race-row">
+            <button class="menu-race" data-race="alliance">
+              <div class="menu-race-name">Слобожани</div>
+              <div class="menu-race-tag">сталь · башни · дисциплина</div>
+            </button>
+            <button class="menu-race" data-race="horde">
+              <div class="menu-race-name">Татари</div>
+              <div class="menu-race-tag">кровь · костры · натиск</div>
+            </button>
+          </div>
+        </div>
+
+        <div class="menu-section">
+          <div class="menu-section-label">Сложность</div>
+          <div class="menu-diff-row">
+            <button class="menu-diff" data-diff="easy">Легко</button>
+            <button class="menu-diff active" data-diff="normal">Обычно</button>
+            <button class="menu-diff" data-diff="hard">Сложно</button>
+          </div>
+        </div>
+
+        <div class="menu-hints">
+          <div>ЛКМ — выбор · Shift+ЛКМ — добавить · двойной ЛКМ — все на экране</div>
+          <div>ПКМ — движение/атака/сбор · Ctrl+1..9 — группа · 1..9 — выбрать</div>
+          <div>Q — атака-движение · X — стоп · H — к ратуше · B — строить · R — рестарт · M — звук</div>
+        </div>
+      </div>
+
+      <button id="menu-debug-toggle" type="button" aria-haspopup="dialog">Debug</button>
+
+      <div id="menu-debug-panel" aria-hidden="true" role="dialog">
+        <div class="menu-debug-card">
+          <div class="menu-debug-header">
+            <div class="menu-debug-title">Debug-сценарии</div>
+            <button class="menu-debug-close" id="menu-debug-close" type="button" aria-label="Закрыть">×</button>
+          </div>
+
+          <div class="menu-debug-section-label">Сценарий</div>
+          <div class="menu-debug-row" id="menu-debug-scenarios">
+            <button type="button" data-scn="pathfinding">Поиск пути</button>
+            <button type="button" data-scn="perf-100">Перф 100</button>
+            <button type="button" data-scn="perf-300">Перф 300</button>
+            <button type="button" data-scn="perf-500">Перф 500</button>
+            <button type="button" data-scn="caravans">Караваны (быстро)</button>
+            <button type="button" data-scn="skirmish" class="active">Стычка</button>
+          </div>
+
+          <div class="menu-debug-section-label">Фракция</div>
+          <div class="menu-debug-row" id="menu-debug-races">
+            <button type="button" data-race="alliance" class="active">Альянс</button>
+            <button type="button" data-race="horde">Орда</button>
+          </div>
+
+          <div class="menu-debug-section-label">Сложность</div>
+          <div class="menu-debug-row" id="menu-debug-diffs">
+            <button type="button" data-diff="easy">Легко</button>
+            <button type="button" data-diff="normal" class="active">Обычно</button>
+            <button type="button" data-diff="hard">Сложно</button>
+          </div>
+
+          <div class="menu-debug-section-label">Seed</div>
+          <input type="number" id="menu-debug-seed" placeholder="случайный" inputmode="numeric">
+
+          <div class="menu-debug-actions">
+            <button type="button" class="btn-secondary" id="menu-debug-cancel">Отмена</button>
+            <button type="button" class="btn-primary menu-debug-start" id="menu-debug-start">Старт</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="ui-layer" style="display: none;">
+      <div id="top-bar" class="glass-panel">
+        <div class="resource-group">
+          <div class="res-gold" id="ui-gold">Золото: 0</div>
+          <div class="res-lumber" id="ui-lumber">Дерево: 0</div>
+          <div class="res-salt" id="ui-salt">Сіль: 0</div>
+          <div class="res-meat" id="ui-meat">Їжа: 0</div>
+          <div class="res-food" id="ui-food">Люди: 0/0</div>
+          <div class="res-dayphase" id="ui-dayphase" aria-hidden="true">
+            <span id="ui-dayphase-icon">☀️</span>
+            <span id="ui-dayphase-label"></span>
+          </div>
+        </div>
+        <div class="status-text" id="ui-mode-text"></div>
+        <div class="help-text" id="ui-help-text">R рестарт  M звук</div>
+      </div>
+
+      <div id="story-objectives" class="glass-panel" aria-hidden="true">
+        <div class="story-panel-label">Цель</div>
+        <div id="story-objective-list"></div>
+      </div>
+
+      <div id="story-clock" class="glass-panel" aria-hidden="true">
+        <span id="story-clock-icon">🌙</span>
+        <span id="story-clock-label"></span>
+        <span id="story-clock-time"></span>
+      </div>
+
+      <div id="story-journal" class="glass-panel" aria-hidden="true">
+        <div class="story-panel-label">Журнал</div>
+        <div id="story-journal-next" class="story-journal-next"></div>
+        <div id="story-journal-list" class="story-journal-list"></div>
+      </div>
+      
+      <div id="bottom-panel" class="glass-panel" style="display: none;">
+        <div class="selection-info">
+          <h2 class="selection-title" id="ui-sel-title">Заголовок</h2>
+          <div class="selection-stats" id="ui-sel-stats">Характеристики</div>
+          <div class="selection-summary" id="ui-sel-summary">Сводка</div>
+          <div id="ui-sel-progress-container" class="progress-container" style="display: none;">
+            <div id="ui-sel-progress-fill" class="progress-fill"></div>
+          </div>
+        </div>
+        <div class="command-actions" id="ui-actions">
+          <!-- buttons go here -->
+        </div>
+      </div>
+
+      <div id="minimap-border" class="glass-panel">
+        <canvas id="minimap-canvas" width="160" height="160"></canvas>
+      </div>
+
+      <div id="entity-tooltip" class="entity-tooltip" aria-hidden="true"></div>
+
+      <div id="story-dialogue" aria-hidden="true">
+        <div class="story-dialogue-box">
+          <img id="story-dialogue-portrait" alt="" draggable="false">
+          <div id="story-dialogue-speaker"></div>
+          <div id="story-dialogue-text"></div>
+          <button id="story-dialogue-continue" type="button">Далі</button>
+        </div>
+      </div>
+
+      <div id="center-message">Недостаточно ресурсов</div>
+    </div>
+    
+    <div id="game-over-screen">
+      <div id="game-over-title">ПОБЕДА</div>
+      <div id="game-over-summary" aria-live="polite"></div>
+      <button class="btn-primary" id="btn-restart">Меню</button>
+    </div>
+
+    <div id="pause-screen" aria-hidden="true">
+      <div class="pause-card">
+        <div class="pause-title">Пауза</div>
+        <div class="pause-hint">ESC — продолжить</div>
+        <div class="pause-actions">
+          <button class="btn-primary" id="btn-pause-resume" type="button">Продолжить</button>
+          <button class="btn-secondary" id="btn-pause-restart" type="button">Перезапустить</button>
+          <button class="btn-secondary" id="btn-pause-menu" type="button">В главное меню</button>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

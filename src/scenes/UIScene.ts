@@ -1,0 +1,1196 @@
+import Phaser from 'phaser';
+import {
+  VIEW_W, VIEW_H, COLORS, MAP_W, MAP_H, WORLD_W, WORLD_H,
+  UNIT, BUILDING, Side, SIDE, BuildingKind, UnitKind, RACE_COLOR, RACE_LABEL, DIFFICULTY,
+  STORY_MAP_LABEL, type GameLaunchConfig, ANIMAL } from '../config';
+import { Unit } from '../entities/Unit';
+import { Building } from '../entities/Building';
+import { ResourceNode } from '../entities/ResourceNode';
+import { Caravan } from '../entities/Caravan';
+import { Animal } from '../entities/Animal';
+import { artAssetUrl } from '../assets/artManifest';
+import { GameScene, type GameOverPayload, type SkirmishSummary } from './GameScene';
+import type { StoryDialogueLine, StoryDialoguePayload, StoryObjectivePayload, StoryObjectiveStatus, StoryObjectiveView } from '../story/types';
+
+interface UIInit {
+  playerSide: Side;
+  launchConfig: GameLaunchConfig;
+}
+
+type HoverEntity = Unit | Building | ResourceNode | Caravan | Animal;
+
+interface EntityHoverPayload {
+  entity: HoverEntity | null;
+  screenX: number;
+  screenY: number;
+}
+
+interface TooltipRow {
+  label: string;
+  value: string;
+}
+
+interface TooltipModel {
+  title: string;
+  subtitle: string;
+  rows: TooltipRow[];
+  role: string;
+}
+
+export class UIScene extends Phaser.Scene {
+  private game_!: GameScene;
+  private playerSide: Side = SIDE.player;
+  private launchConfig: GameLaunchConfig = { mode: 'skirmish', playerRace: 'alliance', difficulty: 'normal' };
+  private baseModeText = '';
+  private modeOverrideText = '';
+
+  private buildMenuOpen = false;
+  private lastPanelUpdate = 0;
+  private lastMinimapUpdate = 0;
+  private panelSignature = '';
+  private hoveredEntity: HoverEntity | null = null;
+  private hoverScreen = { x: 0, y: 0 };
+
+  // DOM Elements
+  private elUiLayer = document.getElementById('ui-layer')!;
+  private elGold = document.getElementById('ui-gold')!;
+  private elLumber = document.getElementById('ui-lumber')!;
+  private elSalt = document.getElementById('ui-salt')!;
+  private elMeat = document.getElementById('ui-meat')!;
+  private elFood = document.getElementById('ui-food')!;
+  private elModeText = document.getElementById('ui-mode-text')!;
+  private elPanel = document.getElementById('bottom-panel')!;
+  private elTitle = document.getElementById('ui-sel-title')!;
+  private elStats = document.getElementById('ui-sel-stats')!;
+  private elSummary = document.getElementById('ui-sel-summary')!;
+  private elProgressCont = document.getElementById('ui-sel-progress-container')!;
+  private elProgressFill = document.getElementById('ui-sel-progress-fill')!;
+  private elActions = document.getElementById('ui-actions')!;
+  private elMessage = document.getElementById('center-message')!;
+  private elTooltip = document.getElementById('entity-tooltip')!;
+  private elGameOver = document.getElementById('game-over-screen')!;
+  private elGameOverTitle = document.getElementById('game-over-title')!;
+  private elGameOverSummary = document.getElementById('game-over-summary')!;
+  private elStoryObjectives = document.getElementById('story-objectives')!;
+  private elStoryObjectiveList = document.getElementById('story-objective-list')!;
+  private elStoryJournal = document.getElementById('story-journal')!;
+  private elStoryJournalNext = document.getElementById('story-journal-next')!;
+  private elStoryJournalList = document.getElementById('story-journal-list')!;
+  private elStoryClock = document.getElementById('story-clock')!;
+  private elStoryClockIcon = document.getElementById('story-clock-icon')!;
+  private elStoryClockLabel = document.getElementById('story-clock-label')!;
+  private elStoryClockTime = document.getElementById('story-clock-time')!;
+  private elDayPhase = document.getElementById('ui-dayphase')!;
+  private elDayPhaseIcon = document.getElementById('ui-dayphase-icon')!;
+  private elDayPhaseLabel = document.getElementById('ui-dayphase-label')!;
+  private elStoryDialogue = document.getElementById('story-dialogue')!;
+  private elStoryDialogueSpeaker = document.getElementById('story-dialogue-speaker')!;
+  private elStoryDialoguePortrait = document.getElementById('story-dialogue-portrait') as HTMLImageElement;
+  private elStoryDialogueText = document.getElementById('story-dialogue-text')!;
+  private elStoryDialogueContinue = document.getElementById('story-dialogue-continue') as HTMLButtonElement;
+  private mmCanvas = document.getElementById('minimap-canvas') as HTMLCanvasElement;
+  private mmCtx = this.mmCanvas.getContext('2d')!;
+
+  private msgTimeout: any;
+  private journalEntries: { time: string; text: string }[] = [];
+  private journalObjectiveStatus = new Map<string, StoryObjectiveStatus>();
+  private clockEndAtMs: number | null = null;
+  private storyDialogueQueue: StoryDialogueLine[] = [];
+  private currentStoryDialogue: StoryDialogueLine | null = null;
+  private storyDialogueTimeout: number | null = null;
+
+  private onSelectionChanged = (): void => {
+    this.buildMenuOpen = false;
+    this.renderCommandPanel();
+  };
+  private onResourcesChanged = (): void => this.renderResources();
+  private onOpenBuild = (): void => this.openBuildMenu();
+  private onOpenTrain = (): void => {
+    this.buildMenuOpen = false;
+    this.renderCommandPanel();
+  };
+  private onFlash = (m: string): void => {
+    this.showMessage(m);
+    this.pushJournalEntry(m);
+  };
+  private onGameOver = (payload: GameOverPayload | boolean): void => this.showGameOver(payload);
+  private onMode = (m: string): void => {
+    this.modeOverrideText = m;
+    this.renderModeText();
+  };
+  private onEntityHover = (payload: EntityHoverPayload): void => this.showEntityTooltip(payload);
+  private onStoryObjectives = (payload: StoryObjectivePayload): void => this.renderStoryObjectives(payload.objectives);
+  private onStoryDialogue = (payload: StoryDialoguePayload): void => this.queueStoryDialogue(payload.lines);
+  private onStoryClock = (payload: { label: string; icon?: string; endAtMs: number }): void => this.showStoryClock(payload);
+  private onStoryClockClear = (): void => this.hideStoryClock();
+  private onStoryDayPhase = (payload: { phase: 'day' | 'night' }): void => this.showDayPhase(payload.phase);
+  private onStoryContinue = (): void => this.advanceStoryDialogue();
+  private onStoryDialogueKeydown = (ev: KeyboardEvent): void => {
+    if (!this.currentStoryDialogue) return;
+    if (ev.key !== 'Enter' && ev.key !== ' ') return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    this.advanceStoryDialogue();
+  };
+
+  constructor() { super('UIScene'); }
+
+  init(data: UIInit): void {
+    this.playerSide = data.playerSide ?? SIDE.player;
+    this.launchConfig = data.launchConfig ?? this.launchConfig;
+    this.baseModeText = modeStatusLabel(this.launchConfig);
+    this.modeOverrideText = '';
+  }
+
+  create(): void {
+    this.game_ = this.scene.get('GameScene') as GameScene;
+
+    this.game.events.on('selection-changed', this.onSelectionChanged);
+    this.game.events.on('resources-changed', this.onResourcesChanged);
+    this.game_.economy.events.on('changed', this.onResourcesChanged);
+    this.game.events.on('ui-open-build', this.onOpenBuild);
+    this.game.events.on('ui-open-train', this.onOpenTrain);
+    this.game.events.on('flash-message', this.onFlash);
+    this.game.events.on('game-over', this.onGameOver);
+    this.game.events.on('ui-mode', this.onMode);
+    this.game.events.on('ui-entity-hover', this.onEntityHover);
+    this.game.events.on('story-objectives', this.onStoryObjectives);
+    this.game.events.on('story-dialogue', this.onStoryDialogue);
+    this.game.events.on('story-clock', this.onStoryClock);
+    this.game.events.on('story-clock-clear', this.onStoryClockClear);
+    this.game.events.on('story-dayphase', this.onStoryDayPhase);
+
+    this.mmCanvas.addEventListener('mousedown', this.onMinimapClick);
+    this.elStoryDialogueContinue.addEventListener('click', this.onStoryContinue);
+    window.addEventListener('keydown', this.onStoryDialogueKeydown, true);
+    this.elTooltip.style.setProperty('--tooltip-frame', `url("${artAssetUrl('assets/art/ui/tooltip_frame.png')}")`);
+
+    document.getElementById('btn-restart')!.onclick = () => {
+      this.elGameOver.classList.remove('visible');
+      this.scene.stop('UIScene'); 
+      this.scene.stop('GameScene');
+      this.scene.start('MenuScene');
+    };
+
+    this.renderResources();
+    this.renderCommandPanel();
+    this.renderModeText();
+    this.elUiLayer.style.display = 'flex';
+    this.elGameOver.classList.remove('visible');
+    this.elGameOverSummary.innerHTML = '';
+
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
+      this.game.events.off('selection-changed', this.onSelectionChanged);
+      this.game.events.off('resources-changed', this.onResourcesChanged);
+      this.game_.economy.events.off('changed', this.onResourcesChanged);
+      this.game.events.off('ui-open-build', this.onOpenBuild);
+      this.game.events.off('ui-open-train', this.onOpenTrain);
+      this.game.events.off('flash-message', this.onFlash);
+      this.game.events.off('game-over', this.onGameOver);
+      this.game.events.off('ui-mode', this.onMode);
+      this.game.events.off('ui-entity-hover', this.onEntityHover);
+      this.game.events.off('story-objectives', this.onStoryObjectives);
+      this.game.events.off('story-dialogue', this.onStoryDialogue);
+      this.game.events.off('story-clock', this.onStoryClock);
+      this.game.events.off('story-clock-clear', this.onStoryClockClear);
+      this.game.events.off('story-dayphase', this.onStoryDayPhase);
+      this.mmCanvas.removeEventListener('mousedown', this.onMinimapClick);
+      this.elStoryDialogueContinue.removeEventListener('click', this.onStoryContinue);
+      window.removeEventListener('keydown', this.onStoryDialogueKeydown, true);
+      this.clearStoryDialogueTimer();
+      this.hideEntityTooltip();
+      this.hideStoryDialogue();
+      this.hideStoryClock();
+      this.journalEntries = [];
+      this.journalObjectiveStatus.clear();
+      this.elStoryJournal.classList.remove('visible');
+      this.elStoryJournal.setAttribute('aria-hidden', 'true');
+      this.renderStoryObjectives([]);
+      this.elUiLayer.style.display = 'none';
+      this.elPanel.style.display = 'none';
+      this.elGold.innerText = 'Золото: 0';
+      this.elLumber.innerText = 'Дерево: 0';
+      this.elSalt.innerText = 'Сіль: 0';
+      this.elMeat.innerText = 'Їжа: 0';
+      this.elFood.innerText = 'Люди: 0/0';
+      this.elModeText.innerText = '';
+      this.elGameOverSummary.innerHTML = '';
+    });
+  }
+
+  private renderModeText(): void {
+    this.elModeText.innerText = this.modeOverrideText || this.baseModeText;
+  }
+
+  private renderStoryObjectives(objectives: StoryObjectiveView[]): void {
+    this.elStoryObjectiveList.replaceChildren();
+    this.trackObjectiveJournal(objectives);
+    this.renderJournalNext(objectives);
+    if (this.launchConfig.mode !== 'story' || objectives.length === 0) {
+      this.elStoryObjectives.classList.remove('visible');
+      this.elStoryObjectives.setAttribute('aria-hidden', 'true');
+      return;
+    }
+
+    for (const objective of objectives) {
+      const item = document.createElement('div');
+      item.className = `story-objective ${objective.status}`;
+
+      const state = document.createElement('span');
+      state.className = `story-objective-state ${objective.status}`;
+      state.textContent = objective.status === 'completed' ? 'DONE' : objective.status === 'failed' ? 'FAIL' : 'NOW';
+
+      const copy = document.createElement('div');
+      copy.className = 'story-objective-copy';
+
+      const title = document.createElement('div');
+      title.className = 'story-objective-title';
+      title.textContent = objective.optional ? `${objective.title} (Optional)` : objective.title;
+      copy.appendChild(title);
+
+      if (objective.description) {
+        const description = document.createElement('div');
+        description.className = 'story-objective-description';
+        description.textContent = objective.description;
+        copy.appendChild(description);
+      }
+
+      if (objective.subObjectives.length > 0) {
+        const subList = document.createElement('div');
+        subList.className = 'story-subobjective-list';
+        for (const sub of objective.subObjectives) {
+          const subEl = document.createElement('div');
+          subEl.className = `story-subobjective ${sub.status}`;
+          subEl.textContent = sub.title;
+          subList.appendChild(subEl);
+        }
+        copy.appendChild(subList);
+      }
+
+      item.append(state, copy);
+      this.elStoryObjectiveList.appendChild(item);
+    }
+
+    this.elStoryObjectives.classList.add('visible');
+    this.elStoryObjectives.setAttribute('aria-hidden', 'false');
+  }
+
+  /** Фіксує переходи об'єктивів/підоб'єктивів у 'completed' як записи журналу. */
+  private trackObjectiveJournal(objectives: StoryObjectiveView[]): void {
+    for (const objective of objectives) {
+      const prev = this.journalObjectiveStatus.get(objective.id);
+      if (prev !== 'completed' && objective.status === 'completed') {
+        this.pushJournalEntry(`Виконано: ${objective.title}`);
+      }
+      this.journalObjectiveStatus.set(objective.id, objective.status);
+
+      for (const sub of objective.subObjectives) {
+        const key = `${objective.id}/${sub.id}`;
+        const prevSub = this.journalObjectiveStatus.get(key);
+        if (prevSub !== 'completed' && sub.status === 'completed') {
+          this.pushJournalEntry(`Виконано: ${sub.title}`);
+        }
+        this.journalObjectiveStatus.set(key, sub.status);
+      }
+    }
+  }
+
+  /** Закріплений блок "Далі" — перший активний обов'язковий об'єктив, або опційний якщо немає інших. */
+  private renderJournalNext(objectives: StoryObjectiveView[]): void {
+    if (this.launchConfig.mode !== 'story') {
+      this.elStoryJournal.classList.remove('visible');
+      this.elStoryJournal.setAttribute('aria-hidden', 'true');
+      return;
+    }
+
+    const active = objectives.filter((o) => o.status === 'active');
+    const next = active.find((o) => !o.optional) ?? active[0] ?? null;
+
+    this.elStoryJournalNext.replaceChildren();
+    if (next) {
+      const label = document.createElement('div');
+      label.className = 'story-journal-next-label';
+      label.textContent = 'Далі';
+      this.elStoryJournalNext.appendChild(label);
+
+      const title = document.createElement('div');
+      title.textContent = next.optional ? `${next.title} (Optional)` : next.title;
+      this.elStoryJournalNext.appendChild(title);
+
+      const activeSub = next.subObjectives.find((s) => s.status === 'active');
+      if (activeSub) {
+        const subEl = document.createElement('div');
+        subEl.style.marginTop = '3px';
+        subEl.style.fontWeight = '600';
+        subEl.style.opacity = '0.8';
+        subEl.textContent = `— ${activeSub.title}`;
+        this.elStoryJournalNext.appendChild(subEl);
+      } else if (next.description) {
+        const desc = document.createElement('div');
+        desc.style.marginTop = '3px';
+        desc.style.fontWeight = '600';
+        desc.style.opacity = '0.8';
+        desc.textContent = next.description;
+        this.elStoryJournalNext.appendChild(desc);
+      }
+    }
+
+    const shouldShow = next !== null || this.journalEntries.length > 0;
+    this.elStoryJournal.classList.toggle('visible', shouldShow);
+    this.elStoryJournal.setAttribute('aria-hidden', shouldShow ? 'false' : 'true');
+  }
+
+  /** Додає запис у журнал подій (найновіші зверху, максимум 20). */
+  private pushJournalEntry(text: string): void {
+    const time = new Date().toLocaleTimeString('uk-UA', { hour: '2-digit', minute: '2-digit' });
+    this.journalEntries.unshift({ time, text });
+    if (this.journalEntries.length > 20) this.journalEntries.length = 20;
+    this.renderJournalList();
+
+    if (this.launchConfig.mode === 'story') {
+      this.elStoryJournal.classList.add('visible');
+      this.elStoryJournal.setAttribute('aria-hidden', 'false');
+    }
+  }
+
+  private renderJournalList(): void {
+    this.elStoryJournalList.replaceChildren();
+    for (const entry of this.journalEntries) {
+      const item = document.createElement('div');
+      item.className = 'story-journal-entry';
+
+      const time = document.createElement('span');
+      time.className = 'story-journal-entry-time';
+      time.textContent = entry.time;
+
+      const text = document.createElement('span');
+      text.textContent = entry.text;
+
+      item.append(time, text);
+      this.elStoryJournalList.appendChild(item);
+    }
+  }
+
+  private showStoryClock(payload: { label: string; icon?: string; endAtMs: number }): void {
+    this.clockEndAtMs = payload.endAtMs;
+    this.elStoryClockIcon.textContent = payload.icon ?? '🌙';
+    this.elStoryClockLabel.textContent = payload.label;
+    this.elStoryClock.classList.add('visible');
+    this.elStoryClock.setAttribute('aria-hidden', 'false');
+    this.refreshStoryClock();
+  }
+
+  private hideStoryClock(): void {
+    this.clockEndAtMs = null;
+    this.elStoryClock.classList.remove('visible');
+    this.elStoryClock.setAttribute('aria-hidden', 'true');
+    this.elStoryClockTime.textContent = '';
+  }
+
+  private refreshStoryClock(): void {
+    if (this.clockEndAtMs === null) return;
+    const remainingMs = this.clockEndAtMs - this.game_.getSimTimeMs();
+    if (remainingMs <= 0) { this.hideStoryClock(); return; }
+    const totalSeconds = Math.ceil(remainingMs / 1000);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    this.elStoryClockTime.textContent = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+  }
+
+  private showDayPhase(phase: 'day' | 'night'): void {
+    const isNight = phase === 'night';
+    this.elDayPhaseIcon.textContent = isNight ? '🌙' : '☀️';
+    this.elDayPhaseLabel.textContent = isNight ? 'Ніч' : 'День';
+    this.elDayPhase.classList.toggle('night', isNight);
+    this.elDayPhase.classList.add('visible');
+    this.elDayPhase.setAttribute('aria-hidden', 'false');
+  }
+
+  private queueStoryDialogue(lines: StoryDialogueLine[]): void {
+    if (this.launchConfig.mode !== 'story' || lines.length === 0) return;
+    this.storyDialogueQueue.push(...lines);
+    if (!this.currentStoryDialogue) this.showNextStoryDialogue();
+  }
+
+  private showNextStoryDialogue(): void {
+    this.clearStoryDialogueTimer();
+    const next = this.storyDialogueQueue.shift() ?? null;
+    this.currentStoryDialogue = next;
+    if (!next) {
+      this.hideStoryDialogue();
+      return;
+    }
+
+    this.game.events.emit('story-dialogue-open');
+    this.elStoryDialogueSpeaker.textContent = next.speaker;
+    this.elStoryDialogueText.textContent = next.text;
+    if (next.portrait) {
+      const src = next.portrait.includes('/')
+        ? this.assetUrl(next.portrait)
+        : this.assetUrl(`assets/sloboda/portraits/${next.portrait}.png`);
+      this.elStoryDialoguePortrait.src = src;
+      this.elStoryDialoguePortrait.classList.add('visible');
+    } else {
+      this.elStoryDialoguePortrait.classList.remove('visible');
+      this.elStoryDialoguePortrait.removeAttribute('src');
+    }
+    this.elStoryDialogue.classList.add('visible');
+    this.elStoryDialogue.setAttribute('aria-hidden', 'false');
+
+    const fallbackMs = next.durationMs ?? (next.requireContinue ? 12000 : 7500);
+    this.storyDialogueTimeout = window.setTimeout(() => this.advanceStoryDialogue(), fallbackMs);
+  }
+
+  private advanceStoryDialogue(): void {
+    if (!this.currentStoryDialogue) return;
+    this.showNextStoryDialogue();
+  }
+
+  private hideStoryDialogue(): void {
+    this.currentStoryDialogue = null;
+    this.storyDialogueQueue = [];
+    this.elStoryDialogue.classList.remove('visible');
+    this.elStoryDialogue.setAttribute('aria-hidden', 'true');
+    this.game.events.emit('story-dialogue-close');
+  }
+
+  private clearStoryDialogueTimer(): void {
+    if (this.storyDialogueTimeout === null) return;
+    window.clearTimeout(this.storyDialogueTimeout);
+    this.storyDialogueTimeout = null;
+  }
+
+  private onMinimapClick = (e: MouseEvent): void => {
+    const rect = this.mmCanvas.getBoundingClientRect();
+    const rx = (e.clientX - rect.left) / rect.width;
+    const ry = (e.clientY - rect.top) / rect.height;
+    const wx = Phaser.Math.Clamp(rx, 0, 1) * WORLD_W;
+    const wy = Phaser.Math.Clamp(ry, 0, 1) * WORLD_H;
+    this.game.events.emit('ui-minimap-click', wx, wy);
+  }
+
+  update(_t: number, dt: number): void {
+    this.lastPanelUpdate += dt;
+    this.lastMinimapUpdate += dt;
+    if (this.clockEndAtMs !== null) this.refreshStoryClock();
+    if (this.lastPanelUpdate >= 250) {
+      this.renderResources();
+      if (!this.buildMenuOpen) this.refreshPanelText();
+      if (this.hoveredEntity) this.refreshEntityTooltip();
+      this.lastPanelUpdate = 0;
+    }
+    if (this.lastMinimapUpdate >= 180) {
+      this.drawMinimap();
+      this.lastMinimapUpdate = 0;
+    }
+  }
+
+  private prevGold = -1;
+  private prevLumber = -1;
+  private prevSalt = -1;
+  private prevMeat = -1;
+  private prevPop = -1;
+  private prevCap = -1;
+
+  private renderResources(): void {
+    const p = this.game_.economy.get(this.playerSide);
+    if (!p) return;
+    this.setResource(this.elGold, this.resourceHtml('gold', 'Золото', `${p.gold}`), p.gold, this.prevGold);
+    this.setResource(this.elLumber, this.resourceHtml('lumber', 'Дерево', `${p.lumber}`), p.lumber, this.prevLumber);
+    this.setResource(this.elSalt, this.resourceHtml('salt', 'Сіль', `${p.salt}`), p.salt, this.prevSalt);
+    this.setResource(this.elMeat, this.resourceHtml('food', 'Їжа', `${p.food}`), p.food, this.prevMeat);
+    this.setResource(this.elFood, `<span class="resource-label">Люди</span><span class="resource-value">${p.pop}/${p.popCap}</span>`, p.pop + p.popCap * 1000, this.prevPop + this.prevCap * 1000);
+    this.prevGold = p.gold;
+    this.prevLumber = p.lumber;
+    this.prevSalt = p.salt;
+    this.prevMeat = p.food;
+    this.prevPop = p.pop;
+    this.prevCap = p.popCap;
+  }
+
+  private resourceHtml(icon: 'gold' | 'lumber' | 'salt' | 'food', label: string, value: string): string {
+    return `<img class="resource-icon" src="${this.iconUrl(icon)}" alt="" draggable="false"><span class="resource-label">${label}</span><span class="resource-value">${value}</span>`;
+  }
+
+  private setResource(el: HTMLElement, html: string, cur: number, prev: number): void {
+    el.innerHTML = html;
+    if (prev >= 0 && cur !== prev) {
+      el.classList.add('pulse');
+      setTimeout(() => el.classList.remove('pulse'), 300);
+    }
+  }
+
+  private iconUrl(icon: string): string {
+    return artAssetUrl(`assets/art/ui/icons/${icon}.png`);
+  }
+
+  private assetUrl(path: string): string {
+    return artAssetUrl(path);
+  }
+
+  private renderCommandPanel(): void {
+    this.buildMenuOpen = false;
+    this.elActions.innerHTML = '';
+    this.panelSignature = this.computeSignature();
+
+    const sel = this.game_.selected;
+    const selBuilding = this.game_.selectedBuilding;
+
+    if (!selBuilding && sel.length === 0) {
+      this.elPanel.style.display = 'none';
+      return;
+    }
+    this.elPanel.style.display = 'flex';
+
+    if (selBuilding) {
+      this.renderBuildingPanel(selBuilding);
+      return;
+    }
+
+    const first = sel[0];
+    this.elTitle.innerText = sel.length > 1
+      ? `Отряд: ${sel.length}`
+      : (first.customName ?? labelForUnit(first.unitKind, first.race));
+    
+    const avgHp = Math.round(sel.reduce((s, u) => s + u.hp, 0) / sel.length);
+    this.elStats.innerText = `HP ${Math.round(first.hp)}/${first.maxHp} • средн. ${avgHp} • атака ${first.atk} • ${stateLabel(first.state)}`;
+    this.elSummary.innerText = summarizeSelection(sel);
+
+    this.elProgressCont.style.display = 'none';
+
+    const hasWorker = sel.some(u => u.isWorker());
+    if (hasWorker) this.addButton('Строить [B]', 'Открыть меню строительства', () => this.openBuildMenu(), '', 'build');
+    if (this.game_.isAutopilotAllowed()) {
+      const autopilotCount = sel.filter(u => u.autopilot).length;
+      const allAutopilot = autopilotCount === sel.length;
+      this.addButton(
+        'Автопилот',
+        allAutopilot ? 'Вернуть выбранных юнитов под ручное управление' : 'Передать выбранных юнитов под автопилот',
+        () => this.game.events.emit('ui-autopilot'),
+        `<span class="cmd-state">${autopilotCount}/${sel.length}</span>`,
+        'autopilot',
+        allAutopilot
+      );
+    }
+    this.addButton('Стоп [X]', 'Сбросить текущие приказы', () => this.game.events.emit('ui-stop'), '', 'stop');
+    this.addButton('Атака [Q]', 'Атака-движение: Q, затем ЛКМ по точке', () => this.showMessage('Нажмите Q, затем ЛКМ по точке атаки'), '', 'attack_move');
+
+    const khar = sel.find(u => u.unitKind === 'kharakternyk');
+    if (khar) {
+      const now = this.game_.time.now;
+      const cd = Math.max(0, khar.abilityReadyAt - now);
+      const ready = cd <= 0;
+      this.addButton(
+        ready ? 'Туманець [T]' : `Туманець ${Math.ceil(cd / 1000)} с`,
+        'Накрити місце імлою: вороги й звірі в ній ледь повзуть, вовки гублять слід',
+        () => this.game.events.emit('ui-cast-tumanets'),
+        ready ? '' : '<span class="cmd-state">···</span>',
+        'support',
+        !ready
+      );
+    }
+  }
+
+  private computeSignature(): string {
+    const storyRestrictions = this.game_.getStoryRestrictionSignature();
+    const sb = this.game_.selectedBuilding;
+    if (sb) return `b:${sb.buildingKind}:${sb.completed ? 1 : 0}:${storyRestrictions}`;
+    const sel = this.game_.selected;
+    if (sel.length === 0) return '';
+    const hasWorker = sel.some(u => u.isWorker()) ? 1 : 0;
+    const autopilotCount = sel.filter(u => u.autopilot).length;
+    const autopilotAllowed = this.game_.isAutopilotAllowed() ? 1 : 0;
+    const khar = sel.find(u => u.unitKind === 'kharakternyk');
+    const kharCd = khar ? Math.max(0, Math.ceil((khar.abilityReadyAt - this.game_.time.now) / 1000)) : -1;
+    return `u:${sel.length}:${hasWorker}:${autopilotCount}:${autopilotAllowed}:${kharCd}:${storyRestrictions}`;
+  }
+
+  private refreshPanelText(): void {
+    const sig = this.computeSignature();
+    if (sig !== this.panelSignature) {
+      this.renderCommandPanel();
+      return;
+    }
+
+    const sel = this.game_.selected;
+    const selBuilding = this.game_.selectedBuilding;
+
+    if (!selBuilding && sel.length === 0) {
+      if (this.elPanel.style.display !== 'none') this.renderCommandPanel();
+      return;
+    }
+
+    if (selBuilding) {
+      const statsParts = [`HP ${Math.round(selBuilding.hp)}/${selBuilding.maxHp}`];
+      if (selBuilding.canAttack()) statsParts.push(`атака ${selBuilding.attack}`, `дальность ${Math.round(selBuilding.range)}`);
+      this.elStats.innerText = statsParts.join(' • ');
+
+      if (!selBuilding.completed) {
+        const pct = selBuilding.progressFraction();
+        this.elSummary.innerText = `Строится: ${Math.floor(pct * 100)}%`;
+        this.elProgressCont.style.display = 'block';
+        this.elProgressFill.style.width = `${pct * 100}%`;
+        return;
+      }
+
+      let summary = selBuilding.rally ? `Точка сбора ${Math.round(selBuilding.rally.x)},${Math.round(selBuilding.rally.y)}` : 'ПКМ по карте задает точку сбора';
+      if (selBuilding.queue.length > 0) {
+        const cur = selBuilding.queue[0];
+        const pct = 1 - cur.remaining / cur.total;
+        const queueStr = selBuilding.queue.map(q => labelForUnit(q.kind, selBuilding.race)).join(' > ');
+        summary = `Очередь: ${queueStr}\n` + summary;
+        this.elProgressCont.style.display = 'block';
+        this.elProgressFill.style.width = `${pct * 100}%`;
+      } else {
+        this.elProgressCont.style.display = 'none';
+      }
+      this.elSummary.innerText = summary;
+      return;
+    }
+
+    const first = sel[0];
+    const avgHp = Math.round(sel.reduce((s, u) => s + u.hp, 0) / sel.length);
+    this.elStats.innerText = `HP ${Math.round(first.hp)}/${first.maxHp} • средн. ${avgHp} • атака ${first.atk} • ${stateLabel(first.state)}`;
+    this.elSummary.innerText = summarizeSelection(sel);
+  }
+
+  private renderBuildingPanel(b: Building): void {
+    this.elTitle.innerText = labelForBuilding(b.buildingKind, b.race);
+    
+    const statsParts = [`HP ${Math.round(b.hp)}/${b.maxHp}`];
+    if (b.canAttack()) statsParts.push(`атака ${b.attack}`, `дальность ${Math.round(b.range)}`);
+    this.elStats.innerText = statsParts.join(' • ');
+
+    if (!b.completed) {
+      const pct = b.progressFraction();
+      this.elSummary.innerText = `Строится: ${Math.floor(pct * 100)}%`;
+      this.elProgressCont.style.display = 'block';
+      this.elProgressFill.style.width = `${pct * 100}%`;
+      return;
+    }
+
+    let summary = b.rally ? `Точка сбора ${Math.round(b.rally.x)},${Math.round(b.rally.y)}` : 'ПКМ по карте задает точку сбора';
+    
+    if (b.queue.length > 0) {
+      const cur = b.queue[0];
+      const pct = 1 - cur.remaining / cur.total;
+      const queueStr = b.queue.map(q => labelForUnit(q.kind, b.race)).join(' > ');
+      summary = `Очередь: ${queueStr}\n` + summary;
+      this.elProgressCont.style.display = 'block';
+      this.elProgressFill.style.width = `${pct * 100}%`;
+    } else {
+      this.elProgressCont.style.display = 'none';
+    }
+    this.elSummary.innerText = summary;
+
+    for (const kind of trainableFor(b.buildingKind)) {
+      const def = UNIT[kind];
+      const label = `Нанять ${labelForUnit(kind, b.race)}`;
+      const tooltip = `${def.food} лимит, ${Math.round(def.build/1000)}с\nЦена: ${def.cost.gold} зол., ${def.cost.lumber} дер.`;
+      this.addButton(
+        label,
+        tooltip,
+        () => this.game.events.emit('ui-train', kind),
+        `<span class="cost">${def.cost.gold} зол.  ${def.cost.lumber} дер.</span>`,
+        kind,
+        false,
+        this.game_.getStoryTrainLock(kind)
+      );
+    }
+  }
+
+  private openBuildMenu(): void {
+    if (!this.game_.selected.some(u => u.isWorker())) { this.showMessage('Нужен рабочий'); return; }
+    this.buildMenuOpen = true;
+    this.elActions.innerHTML = '';
+    
+    this.elTitle.innerText = 'Строительство';
+    this.elStats.innerText = 'ESC отменяет размещение';
+    this.elSummary.innerText = 'Выберите здание';
+    this.elProgressCont.style.display = 'none';
+
+    const defs: BuildingKind[] = ['farm', 'field', 'barracks', 'workshop', 'tower', 'townhall'];
+    defs.forEach((kind) => {
+      const def = BUILDING[kind];
+      const label = `${labelForBuilding(kind, this.game_.playerRace)} [${def.hotkey}]`;
+      const foodAdd = def.food ? `(+${def.food} лимит)` : '';
+      this.addButton(label, buildTooltip(kind), () => {
+        this.game.events.emit('ui-build', kind);
+        this.buildMenuOpen = false;
+        this.renderCommandPanel();
+      }, `<span class="cost">${def.cost.gold} зол. ${def.cost.lumber} дер. ${foodAdd}</span>`, 'build', false, this.game_.getStoryBuildLock(kind));
+    });
+  }
+
+  private addButton(
+    label: string,
+    tooltip: string,
+    onClick: () => void,
+    extraHtml = '',
+    icon?: string,
+    active = false,
+    disabledReason: string | null = null
+  ): void {
+    const btn = document.createElement('button');
+    btn.className = active ? 'cmd-btn active' : 'cmd-btn';
+    if (active) btn.setAttribute('aria-pressed', 'true');
+    if (disabledReason) {
+      btn.classList.add('locked');
+      btn.setAttribute('aria-disabled', 'true');
+    }
+    const iconHtml = icon ? `<img class="cmd-icon" src="${this.iconUrl(icon)}" alt="" draggable="false">` : '';
+    btn.innerHTML = `${iconHtml}<span class="cmd-copy"><span class="cmd-label">${escapeHtml(label)}</span>${extraHtml}</span>`;
+    btn.onclick = () => {
+      if (disabledReason) {
+        this.showMessage(disabledReason);
+        return;
+      }
+      onClick();
+    };
+    btn.onmouseenter = () => { this.elModeText.innerText = disabledReason ?? tooltip; };
+    btn.onmouseleave = () => { this.renderModeText(); };
+    this.elActions.appendChild(btn);
+  }
+
+  private showEntityTooltip(payload: EntityHoverPayload): void {
+    if (!payload.entity || !payload.entity.alive) {
+      this.hideEntityTooltip();
+      return;
+    }
+    this.hoveredEntity = payload.entity;
+    this.hoverScreen = { x: payload.screenX, y: payload.screenY };
+    this.refreshEntityTooltip();
+  }
+
+  private hideEntityTooltip(): void {
+    this.hoveredEntity = null;
+    this.elTooltip.classList.remove('visible');
+    this.elTooltip.setAttribute('aria-hidden', 'true');
+  }
+
+  private refreshEntityTooltip(): void {
+    const entity = this.hoveredEntity;
+    if (!entity || !entity.alive) {
+      this.hideEntityTooltip();
+      return;
+    }
+
+    const model = describeTooltip(entity);
+    this.elTooltip.replaceChildren();
+
+    const title = document.createElement('div');
+    title.className = 'entity-tooltip-title';
+    title.textContent = model.title;
+    this.elTooltip.appendChild(title);
+
+    const subtitle = document.createElement('div');
+    subtitle.className = 'entity-tooltip-subtitle';
+    subtitle.textContent = model.subtitle;
+    this.elTooltip.appendChild(subtitle);
+
+    const rows = document.createElement('div');
+    rows.className = 'entity-tooltip-rows';
+    for (const row of model.rows) {
+      const rowEl = document.createElement('div');
+      rowEl.className = 'entity-tooltip-row';
+      const label = document.createElement('span');
+      label.textContent = row.label;
+      const value = document.createElement('span');
+      value.textContent = row.value;
+      rowEl.append(label, value);
+      rows.appendChild(rowEl);
+    }
+    this.elTooltip.appendChild(rows);
+
+    const role = document.createElement('div');
+    role.className = 'entity-tooltip-role';
+    role.textContent = model.role;
+    this.elTooltip.appendChild(role);
+
+    this.elTooltip.style.visibility = 'hidden';
+    this.elTooltip.classList.add('visible');
+    this.elTooltip.setAttribute('aria-hidden', 'false');
+    this.positionEntityTooltip();
+    this.elTooltip.style.visibility = '';
+  }
+
+  private positionEntityTooltip(): void {
+    const margin = 12;
+    const gap = 16;
+    const rect = this.elTooltip.getBoundingClientRect();
+    let x = this.hoverScreen.x + gap;
+    let y = this.hoverScreen.y + gap;
+
+    if (x + rect.width > window.innerWidth - margin) x = this.hoverScreen.x - rect.width - gap;
+    if (y + rect.height > window.innerHeight - margin) y = this.hoverScreen.y - rect.height - gap;
+
+    const panelRect = this.blockingRect(this.elPanel);
+    const minimapRect = this.blockingRect(document.getElementById('minimap-border')!);
+    if (this.rectIntersects(x, y, rect.width, rect.height, panelRect) || this.rectIntersects(x, y, rect.width, rect.height, minimapRect)) {
+      const blockerTop = Math.min(panelRect?.top ?? Infinity, minimapRect?.top ?? Infinity);
+      if (Number.isFinite(blockerTop)) y = blockerTop - rect.height - gap;
+    }
+
+    x = Phaser.Math.Clamp(x, margin, Math.max(margin, window.innerWidth - rect.width - margin));
+    y = Phaser.Math.Clamp(y, margin, Math.max(margin, window.innerHeight - rect.height - margin));
+    this.elTooltip.style.left = `${Math.round(x)}px`;
+    this.elTooltip.style.top = `${Math.round(y)}px`;
+  }
+
+  private blockingRect(el: HTMLElement): DOMRect | null {
+    const style = window.getComputedStyle(el);
+    if (style.pointerEvents === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return null;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 ? rect : null;
+  }
+
+  private rectIntersects(x: number, y: number, w: number, h: number, rect: DOMRect | null): boolean {
+    if (!rect) return false;
+    return x < rect.right && x + w > rect.left && y < rect.bottom && y + h > rect.top;
+  }
+
+  private showMessage(text: string): void {
+    this.elMessage.innerText = text;
+    this.elMessage.classList.add('show');
+    
+    if (this.msgTimeout) clearTimeout(this.msgTimeout);
+    this.msgTimeout = setTimeout(() => {
+      this.elMessage.classList.remove('show');
+    }, 2000);
+  }
+
+  private showGameOver(result: GameOverPayload | boolean): void {
+    const win = typeof result === 'boolean' ? result : result.win;
+    const payload = typeof result === 'boolean' ? null : result;
+    this.elGameOver.classList.add('visible');
+    this.elGameOverTitle.innerText = payload?.story?.title ?? (win ? 'ПОБЕДА' : 'ПОРАЖЕНИЕ');
+    this.elGameOverTitle.className = win ? 'win' : 'lose';
+    this.elGameOverSummary.innerHTML = payload?.story
+      ? renderStorySummary(payload.story.lines)
+      : payload?.summary
+        ? renderSkirmishSummary(payload.summary)
+        : '';
+  }
+
+  private drawMinimap(): void {
+    if (!this.game_ || !this.game_.map || !this.game_.fog) return;
+    const w = this.mmCanvas.width;
+    const h = this.mmCanvas.height;
+    this.mmCtx.fillStyle = '#0b0d0e';
+    this.mmCtx.fillRect(0, 0, w, h);
+    
+    const scale = w / MAP_W;
+    const iScale = Math.ceil(scale);
+
+    for (let y = 0; y < MAP_H; y++) {
+      for (let x = 0; x < MAP_W; x++) {
+        const explored = this.game_.fog.isExplored(x, y);
+        if (!explored) continue;
+        
+        const t = this.game_.map.get(x, y);
+        let c = '#435f2d';
+        if (t === 2) c = '#24451f';
+        else if (t === 3) c = '#676663';
+        else if (t === 4) c = '#1c607f';
+        else if (t === 5) c = '#735234';
+        else if (t === 1) c = '#536f36';
+        
+        this.mmCtx.fillStyle = c;
+        this.mmCtx.fillRect(x * scale, y * scale, iScale, iScale);
+      }
+    }
+
+    const mapUnit = (x: number, y: number, color: string, size: number) => {
+      this.mmCtx.fillStyle = color;
+      this.mmCtx.fillRect(x * scale, y * scale, size, size);
+    };
+
+    const numToHex = (n: number) => '#' + n.toString(16).padStart(6, '0');
+    const pColor = numToHex(RACE_COLOR[this.game_.playerRace]);
+    const aColor = numToHex(RACE_COLOR[this.game_.aiRace]);
+
+    for (const r of this.game_.resources) {
+      if (!r.alive) continue;
+      const { tx, ty } = this.game_.map.worldToTile(r.x, r.y);
+      if (!this.game_.fog.isExplored(tx, ty)) continue;
+      mapUnit(tx, ty, r.resourceType === 'gold' ? '#d9ad3d' : '#305020', 2);
+    }
+    for (const b of this.game_.buildings) {
+      if (!b.alive) continue;
+      const c = b.centerTile();
+      if (b.side !== SIDE.player && !this.game_.fog.isExplored(c.tx, c.ty)) continue;
+      mapUnit(c.tx, c.ty, b.side === SIDE.player ? pColor : aColor, 3);
+    }
+    for (const u of this.game_.units) {
+      if (!u.alive) continue;
+      const { tx, ty } = this.game_.map.worldToTile(u.x, u.y);
+      if (u.side !== SIDE.player && !this.game_.fog.isVisible(tx, ty)) continue;
+      mapUnit(tx, ty, u.side === SIDE.player ? pColor : aColor, 2);
+    }
+    for (const c of this.game_.caravans) {
+      if (!c.alive) continue;
+      const { tx, ty } = this.game_.map.worldToTile(c.x, c.y);
+      if (!this.game_.fog.isVisible(tx, ty)) continue;
+      mapUnit(tx, ty, '#d9ad3d', 2);
+    }
+
+    // View rect
+    const cam = this.game_.cameras.main;
+    const view = cam.worldView;
+    const vx = (view.x / WORLD_W) * w;
+    const vy = (view.y / WORLD_H) * h;
+    const vw = (view.width / WORLD_W) * w;
+    const vh = (view.height / WORLD_H) * h;
+    
+    this.mmCtx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
+    this.mmCtx.lineWidth = 1;
+    this.mmCtx.strokeRect(vx, vy, vw, vh);
+  }
+}
+
+function labelForUnit(k: UnitKind, race: Unit['race']): string {
+  return UNIT[k].labelByRace[race];
+}
+
+function labelForBuilding(k: BuildingKind, race: Building['race']): string {
+  return BUILDING[k].labelByRace[race];
+}
+
+function trainableFor(kind: BuildingKind): UnitKind[] {
+  if (kind === 'townhall') return ['worker'];
+  if (kind === 'barracks') return ['footman', 'archer', 'knight'];
+  if (kind === 'workshop') return ['catapult'];
+  return [];
+}
+
+function summarizeUnits(units: Unit[]): string {
+  const counts = new Map<UnitKind, number>();
+  for (const u of units) counts.set(u.unitKind, (counts.get(u.unitKind) ?? 0) + 1);
+  return [...counts.entries()].map(([kind, n]) => `${UNIT[kind].labelByRace[units[0].race]} x${n}`).join(' • ');
+}
+
+function summarizeSelection(units: Unit[]): string {
+  let summary = summarizeUnits(units);
+  const cargo = units.find(u => u.cargo)?.cargo;
+  if (cargo) summary += `\nНесет: ${cargo.type === 'gold' ? 'золото' : 'дерево'} x${cargo.amount}`;
+  const autopilotCount = units.filter(u => u.autopilot).length;
+  if (autopilotCount > 0) summary += `\nАвтопилот: ${autopilotCount}/${units.length}`;
+  return summary;
+}
+
+function renderSkirmishSummary(summary: SkirmishSummary): string {
+  const rows: [string, string][] = [
+    ['Время', formatDuration(summary.durationMs)],
+    ['Убито', `${summary.unitsKilled}`],
+    ['Потери', `${summary.unitsLost}`],
+    ['Ресурсы', `${summary.resourcesGathered.gold} зол. / ${summary.resourcesGathered.lumber} дер.`],
+    ['Караваны', `${summary.caravansLooted}`]
+  ];
+  return rows
+    .map(([label, value]) => `<div class="game-over-summary-row"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`)
+    .join('');
+}
+
+function renderStorySummary(lines: string[]): string {
+  return lines
+    .map((line) => `<div class="story-ending-line">${escapeHtml(line)}</div>`)
+    .join('');
+}
+
+function formatDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+}
+
+function buildTooltip(kind: BuildingKind): string {
+  if (kind === 'farm') return 'Увеличивает лимит снабжения';
+  if (kind === 'barracks') return 'Нанимает пехоту и кавалерию';
+  if (kind === 'workshop') return 'Открывает рыцарей и осадные машины';
+  if (kind === 'tower') return 'Автоматически атакует врагов рядом';
+  if (kind === 'field') return 'Со временем дает еду';
+  return 'Новая база, склад и производство рабочих';
+}
+
+function stateLabel(state: Unit['state']): string {
+  if (state === 'idle') return 'ожидает';
+  if (state === 'move') return 'движется';
+  if (state === 'attack_move') return 'атака-движение';
+  if (state === 'attack') return 'атакует';
+  if (state === 'gather') return 'добывает';
+  if (state === 'return_cargo') return 'несет груз';
+  if (state === 'build') return 'строит';
+  return 'мертв';
+}
+
+function describeTooltip(entity: HoverEntity): TooltipModel {
+  if (entity instanceof Unit) return describeUnitTooltip(entity);
+  if (entity instanceof Building) return describeBuildingTooltip(entity);
+  if (entity instanceof Caravan) return describeCaravanTooltip(entity);
+  if (entity instanceof Animal) return describeAnimalTooltip(entity);
+  return describeResourceTooltip(entity);
+}
+
+function describeAnimalTooltip(a: Animal): TooltipModel {
+  const def = ANIMAL[a.animalKind];
+  const rows: TooltipRow[] = [{ label: 'HP', value: `${Math.round(a.hp)}/${a.maxHp}` }];
+  if (def.atk > 0) rows.push({ label: 'Атака', value: `${def.atk}` });
+  if (def.foodAmount > 0) rows.push({ label: 'Здобич', value: `${def.foodAmount} їжі` });
+  if (a.animalKind === 'wolf_den') {
+    return {
+      title: def.label,
+      subtitle: 'Загроза',
+      rows,
+      role: 'Поки лігво стоїть, зграя поповнюється. Розоріть його — і ліс стане безпечнішим.'
+    };
+  }
+  return {
+    title: def.label,
+    subtitle: def.predator ? 'Хижак' : 'Дика звірина',
+    rows,
+    role: def.predator
+      ? 'Вовки полюють на самотніх селян і дичину. Тримаються зграєю біля лігва.'
+      : 'Вполюйте звіра — туша лишиться на місці, селяни розберуть її на їжу.'
+  };
+}
+
+function describeUnitTooltip(u: Unit): TooltipModel {
+  const rows: TooltipRow[] = [
+    { label: 'HP', value: `${Math.round(u.hp)}/${u.maxHp}` },
+    { label: 'Обзор', value: `${u.sight}` },
+    { label: 'Состояние', value: stateLabel(u.state) }
+  ];
+  if (u.canAttack()) {
+    rows.splice(1, 0, { label: 'Атака', value: `${u.atk}` }, { label: 'Дальность', value: `${Math.round(u.range)}` });
+  }
+  if (u.side === SIDE.player) rows.push({ label: 'Автопилот', value: u.autopilot ? 'включен' : 'выключен' });
+  if (u.isWorker()) rows.push({ label: 'Груз', value: u.cargo ? `${resourceLabel(u.cargo.type)} x${u.cargo.amount}` : 'пусто' });
+  return {
+    title: labelForUnit(u.unitKind, u.race),
+    subtitle: `${sideLabel(u.side)} • ${RACE_LABEL[u.race]} • ${unitTypeLabel(u.unitKind)}`,
+    rows,
+    role: unitRole(u.unitKind)
+  };
+}
+
+function describeBuildingTooltip(b: Building): TooltipModel {
+  const rows: TooltipRow[] = [
+    { label: 'HP', value: `${Math.round(b.hp)}/${b.maxHp}` },
+    { label: 'Обзор', value: `${b.sight}` }
+  ];
+  if (b.canAttack()) rows.splice(1, 0, { label: 'Атака', value: `${b.attack}` }, { label: 'Дальность', value: `${Math.round(b.range)}` });
+
+  if (!b.completed) {
+    rows.push({ label: 'Состояние', value: `строится ${Math.floor(b.progressFraction() * 100)}%` });
+  } else if (b.queue.length > 0) {
+    const current = b.queue[0];
+    const pct = Math.floor((1 - current.remaining / current.total) * 100);
+    rows.push({ label: 'Производство', value: `${labelForUnit(current.kind, b.race)} ${pct}%` });
+    rows.push({ label: 'Очередь', value: b.queue.map(q => labelForUnit(q.kind, b.race)).join(' > ') });
+  } else {
+    rows.push({ label: 'Состояние', value: b.hp < b.maxHp ? 'повреждено' : 'готово' });
+  }
+  if (b.rally && b.completed) rows.push({ label: 'Сбор', value: `${Math.round(b.rally.x)}, ${Math.round(b.rally.y)}` });
+
+  return {
+    title: labelForBuilding(b.buildingKind, b.race),
+    subtitle: `${sideLabel(b.side)} • ${RACE_LABEL[b.race]} • ${buildingTypeLabel(b.buildingKind)}`,
+    rows,
+    role: buildingRole(b.buildingKind)
+  };
+}
+
+function describeResourceTooltip(r: ResourceNode): TooltipModel {
+  return {
+    title: r.resourceType === 'gold' ? 'Золота жила'
+      : r.resourceType === 'salt' ? 'Соляне джерело'
+      : r.resourceType === 'food' ? 'Туша'
+      : 'Ліс',
+    subtitle: 'Нейтральний ресурс',
+    rows: [
+      { label: 'Запас', value: `${Math.max(0, r.amount)}/${r.maxHp}` },
+      { label: 'Тип', value: resourceLabel(r.resourceType) }
+    ],
+    role: r.resourceType === 'gold' ? 'Селяни добувають тут золото.'
+      : r.resourceType === 'salt' ? 'Селяни виварюють тут сіль.'
+      : r.resourceType === 'food' ? 'Селяни розбирають здобич на їжу, поки вона не зіпсувалась.'
+      : 'Селяни рубають дерева на деревину.'
+  };
+}
+
+function describeCaravanTooltip(c: Caravan): TooltipModel {
+  return {
+    title: 'Чумацька валка',
+    subtitle: `${sideLabel(c.side)} • чумаки`,
+    rows: [
+      { label: 'HP', value: `${Math.round(c.hp)}/${c.maxHp}` },
+      { label: 'Скорость', value: `${Math.round(c.speed)}` }
+    ],
+    role: 'Чумаки везуть сіль Муравським шляхом. Можна пограбувати — та хто грабує чумаків, той сусідів не матиме.'
+  };
+}
+
+function sideLabel(side: Side): string {
+  if (side === SIDE.player) return 'Игрок';
+  if (side === SIDE.ai) return 'Враг';
+  return 'Нейтрально';
+}
+
+function resourceLabel(type: 'gold' | 'lumber' | 'salt' | 'food'): string {
+  if (type === 'gold') return 'золото';
+  if (type === 'salt') return 'сіль';
+  if (type === 'food') return 'їжа';
+  return 'дерево';
+}
+
+function unitTypeLabel(kind: UnitKind): string {
+  if (kind === 'worker') return 'рабочий';
+  if (kind === 'footman') return 'пехота';
+  if (kind === 'archer') return 'стрелок';
+  if (kind === 'knight') return 'кавалерия';
+  if (kind === 'kharakternyk') return 'герой';
+  return 'осада';
+}
+
+function buildingTypeLabel(kind: BuildingKind): string {
+  if (kind === 'townhall') return 'центр базы';
+  if (kind === 'farm') return 'снабжение';
+  if (kind === 'barracks') return 'казармы';
+  if (kind === 'workshop') return 'мастерская';
+  if (kind === 'field') return 'продовольствие';
+  return 'оборона';
+}
+
+function unitRole(kind: UnitKind): string {
+  if (kind === 'worker') return 'Добывает ресурсы и строит здания.';
+  if (kind === 'footman') return 'Ближний бой и удержание линии.';
+  if (kind === 'archer') return 'Дальний бой против легких целей.';
+  if (kind === 'knight') return 'Быстрый ударный юнит ближнего боя.';
+  if (kind === 'kharakternyk') return 'Герой: бачить далі за всіх, насилає туманець. Не вмирає тихо.';
+  return 'Осадный юнит с большим уроном по зданиям.';
+}
+
+function buildingRole(kind: BuildingKind): string {
+  if (kind === 'townhall') return 'Принимает ресурсы и обучает рабочих.';
+  if (kind === 'farm') return 'Увеличивает лимит снабжения.';
+  if (kind === 'barracks') return 'Обучает пехоту, стрелков и кавалерию.';
+  if (kind === 'workshop') return 'Открывает тяжелые войска и осаду.';
+  if (kind === 'field') return 'Со временем приносит еду без рабочих рук.';
+  return 'Автоматически атакует врагов рядом.';
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  }[ch]!));
+}
+
+function modeStatusLabel(config: GameLaunchConfig): string {
+  if (config.mode === 'story') return `Сюжетная карта · ${STORY_MAP_LABEL[config.storyMapId]}`;
+  return `Стычка 1×1 · ${DIFFICULTY[config.difficulty].label}`;
+}

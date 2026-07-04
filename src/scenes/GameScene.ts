@@ -1,0 +1,4173 @@
+import Phaser from 'phaser';
+import {
+  TILE, WORLD_W, WORLD_H, VIEW_W, VIEW_H,
+  CAMERA_SPEED, CAMERA_ZOOM, EDGE_SCROLL_PX,
+  Side, SIDE, Race, Difficulty, GameMode, StoryMapId, GameLaunchConfig, DIFFICULTY, COLORS, RACE_COLOR,
+  UNIT, BUILDING, UnitKind, BuildingKind,
+  RESOURCE, CARAVAN_CONFIG, FOG, FEEL, VISUALS, SKIRMISH_CONFIG
+, ANIMAL, MAP_W, MAP_H, TUMANETS, AnimalKind } from '../config';
+import { TileMap, TileType } from '../world/TileMap';
+import { generateMap, MapLayout } from '../world/MapGenerator';
+import { FogOfWar } from '../world/FogOfWar';
+import { Unit } from '../entities/Unit';
+import { Building } from '../entities/Building';
+import { ResourceNode } from '../entities/ResourceNode';
+import { Caravan } from '../entities/Caravan';
+import { Animal } from '../entities/Animal';
+import { getHealthBarStats, resetHealthBarStats, IEntity } from '../entities/Entity';
+import { findPath, getPathfindingStats, resetPathfindingStats } from '../systems/Pathfinding';
+import { Economy, EconCost } from '../systems/Economy';
+import { runAI, AIState } from '../systems/AI';
+import { runPlayerAutopilot } from '../systems/PlayerAutopilot';
+import { EffectsSystem } from '../systems/EffectsSystem';
+import { AudioSystem } from '../systems/AudioSystem';
+import { formationSlots } from '../systems/Formation';
+import { SpatialIndex } from '../systems/SpatialIndex';
+import { nearestReachableWalkable } from '../world/MapValidation';
+import { StoryController } from '../story/StoryController';
+import { createStoryMap } from '../story/storyMap';
+import type {
+  StoryAtmosphereTone,
+  StoryCameraBeat,
+  StoryControllerGameApi,
+  StoryFxKind,
+  StoryGroupCommand,
+  StoryLandmark,
+  StoryMapDefinition,
+  StoryRuntimeEvent,
+  StoryScriptedUnit,
+  StoryUnitSnapshot
+} from '../story/types';
+import {
+  BUILDING_ART_DISPLAY,
+  CARAVAN_ART_DISPLAY,
+  UNIT_ART_DISPLAY,
+  artAssetUrl,
+  buildingArtReady,
+  buildingSheetKey,
+  caravanSheetKey,
+  getBuildingStageFrame,
+  unitSheetKey
+} from '../assets/artManifest';
+
+const RES_LETTER: Record<string, string> = { gold: 'З', lumber: 'Д', salt: 'С', food: 'Ї' };
+const RES_MARKER: Record<string, string> = { gold: 'Золото', lumber: 'Дерево', salt: 'Сіль', food: 'Здобич' };
+const RES_LABEL: Record<string, string> = { gold: 'золото', lumber: 'дерево', salt: 'сіль', food: 'їжа' };
+
+type PerfScenarioSize = 100 | 300 | 500;
+
+export type GameInit = GameLaunchConfig & {
+  debugPerfSize?: PerfScenarioSize;
+  debugPathfinding?: boolean;
+  debugPerf?: boolean;
+  debugCaravans?: boolean;
+};
+
+type Point = { x: number; y: number };
+type RepathReason = 'command' | 'group' | 'group-fallback' | 'attack-move' | 'target' | 'resource' | 'return' | 'build' | 'stuck';
+
+export interface SkirmishSummary {
+  durationMs: number;
+  unitsKilled: number;
+  unitsLost: number;
+  resourcesGathered: { gold: number; lumber: number; salt: number; food: number };
+  caravansLooted: number;
+}
+
+export interface StoryGameOverSummary {
+  title: string;
+  lines: string[];
+}
+
+export interface GameOverPayload {
+  win: boolean;
+  summary?: SkirmishSummary;
+  story?: StoryGameOverSummary;
+}
+
+interface SkirmishStats {
+  startedAtMs: number;
+  unitsKilled: number;
+  unitsLost: number;
+  resourcesGathered: { gold: number; lumber: number; salt: number; food: number };
+  caravansLooted: number;
+}
+
+interface SharedGroupPath {
+  points: Point[];
+  tailCache: Map<string, Point[] | null>;
+}
+
+interface StoryRevealArea {
+  tx: number;
+  ty: number;
+  radiusTiles: number;
+}
+
+const MAX_REPATHS_PER_FRAME = 8;
+const SINGLE_REPATH_COOLDOWN_MS = 420;
+const GROUP_REPATH_COOLDOWN_MS = 900;
+const STUCK_REPATH_MS = 1400;
+const STUCK_PROGRESS_PX = 5;
+const GROUP_LANE_OFFSET_MAX = TILE * 3.5;
+const GROUP_SLOT_ARRIVAL_RADIUS = 12;
+const GROUP_SLOT_SETTLE_RADIUS = 34;
+const GROUP_SLOT_AVOID_FADE_RADIUS = TILE * 3;
+const RESOURCE_GATHER_SOFT_REACH = TILE * 2.75;
+const RESOURCE_GATHER_WAIT_MS = 900;
+const PERF_UNIT_MIX: UnitKind[] = ['worker', 'footman', 'archer', 'knight', 'catapult', 'footman', 'archer', 'knight'];
+const CURSOR_HOTSPOTS: Record<string, { x: number; y: number }> = {
+  cursor_default: { x: 2, y: 2 },
+  cursor_attack: { x: 16, y: 16 },
+  cursor_build_ok: { x: 18, y: 18 },
+  cursor_build_no: { x: 18, y: 18 },
+  cursor_gather: { x: 18, y: 18 }
+};
+const HI_RES_DECAL_MIN_WIDTH = 24;
+const HI_RES_DECAL_SCALE = 0.5;
+const PROJECTILE_DISPLAY: Record<string, { width: number; height: number }> = {
+  projectile_arrow: { width: 16, height: 8 },
+  projectile_stone: { width: 14, height: 14 },
+  projectile_tower: { width: 18, height: 18 }
+};
+const STORY_LANDMARK_SCALE = 2 / 3;
+
+function hexColor(color: number): string {
+  return `#${color.toString(16).padStart(6, '0')}`;
+}
+
+function atmosphereSpec(tone: StoryAtmosphereTone): { color: number; alpha: number; blendMode: number } {
+  switch (tone) {
+    case 'ashen':
+      return { color: 0x5a4733, alpha: 0.09, blendMode: Phaser.BlendModes.MULTIPLY };
+    case 'forbidden':
+      return { color: 0xff7a32, alpha: 0.075, blendMode: Phaser.BlendModes.ADD };
+    case 'night':
+      return { color: 0x0a1030, alpha: 0.55, blendMode: Phaser.BlendModes.MULTIPLY };
+    case 'normal':
+    default:
+      return { color: 0xffd7a0, alpha: 0.035, blendMode: Phaser.BlendModes.ADD };
+  }
+}
+
+function freshSkirmishStats(): SkirmishStats {
+  return {
+    startedAtMs: 0,
+    unitsKilled: 0,
+    unitsLost: 0,
+    resourcesGathered: { gold: 0, lumber: 0, salt: 0, food: 0 },
+    caravansLooted: 0
+  };
+}
+
+function unitSacrificeRank(unit: Unit): number {
+  switch (unit.unitKind) {
+    case 'footman': return 0;
+    case 'archer': return 1;
+    case 'knight': return 2;
+    case 'catapult': return 3;
+    case 'kharakternyk': return 3;
+    case 'worker': return 4;
+  }
+}
+
+export class GameScene extends Phaser.Scene {
+  map!: TileMap;
+  layout!: MapLayout;
+  units: Unit[] = [];
+  buildings: Building[] = [];
+  resources: ResourceNode[] = [];
+  caravans: Caravan[] = [];
+  animals: Animal[] = [];
+  projectiles: Projectile[] = [];
+  selected: Unit[] = [];
+  selectedBuilding: Building | null = null;
+  economy = new Economy();
+  fog!: FogOfWar;
+  effects!: EffectsSystem;
+  audio!: AudioSystem;
+  mode: GameMode = 'skirmish';
+  playerRace: Race = 'alliance';
+  aiRace: Race = 'horde';
+  difficulty: Difficulty = 'normal';
+  storyMapId: StoryMapId | null = null;
+  seed = 42;
+  launchConfig: GameLaunchConfig = { mode: 'skirmish', playerRace: 'alliance', difficulty: 'normal' };
+  aiState: AIState = {
+    phase: 'economy',
+    nextCheckMs: 0,
+    armyTargetScore: 9,
+    regroupUntilMs: 0,
+    lastPressureMs: Number.NEGATIVE_INFINITY,
+    lastAttackOrderMs: Number.NEGATIVE_INFINITY,
+    lastDefenseOrderMs: Number.NEGATIVE_INFINITY,
+    lastCaravanOrderMs: Number.NEGATIVE_INFINITY
+  };
+
+  private tileLayer!: Phaser.GameObjects.Container;
+  private waterTiles: Phaser.GameObjects.Image[] = [];
+  private waterPhase = 0;
+  private cameraVel = { x: 0, y: 0 };
+  private selectionRect!: Phaser.GameObjects.Graphics;
+  private footprint!: Phaser.GameObjects.Graphics;
+  private rallyGraphics!: Phaser.GameObjects.Graphics;
+  private selectionRings: Phaser.GameObjects.Sprite[] = [];
+  private buildingSelectionRing: Phaser.GameObjects.Sprite | null = null;
+  private placementKind: BuildingKind | null = null;
+  private placementGhost: Phaser.GameObjects.Sprite | null = null;
+  private attackMoveMode = false;
+  private castTumanetsMode = false;
+  private dragStart: { x: number; y: number } | null = null;
+  private panStart: { x: number; y: number; sx: number; sy: number } | null = null;
+  private controlGroups: Record<number, Unit[]> = {};
+  private lastCombatTickMs = 0;
+  private lastFogTickMs = 0;
+  private lastAITickMs = 0;
+  private lastUnderAttackMs = -9999;
+  private lastClick: { kind: UnitKind; time: number } | null = null;
+  private cursorKeys!: Phaser.Types.Input.Keyboard.CursorKeys;
+  private wasdKeys!: { W: Phaser.Input.Keyboard.Key, A: Phaser.Input.Keyboard.Key, S: Phaser.Input.Keyboard.Key, D: Phaser.Input.Keyboard.Key };
+  private gameOver = false;
+  private cursorEl: HTMLImageElement | null = null;
+  private lastCursorKey = 'cursor_default';
+  private lastCursorClient = { x: -1000, y: -1000 };
+  private lastCursorCheckMs = 0;
+  private lastHoverCheckMs = 0;
+  private hoveredEntity: IEntity | null = null;
+  private caravanNextSpawnMs = Infinity;
+  private caravanRouteFlip = false;
+  private testMode = false;
+  private testSpeedMul = 1;
+  /** Сюжетний "ігровий" час — рахується зі швидкістю гри (для нічного таймера/триггерів). */
+  private simTimeMs = 0;
+
+  getSimTimeMs(): number { return this.simTimeMs; }
+  private debugCaravans = false;
+  private debugPathfinding = false;
+  private debugPerf = false;
+  private debugPerfSize: PerfScenarioSize = 100;
+  private requestedPerfSize: PerfScenarioSize | null = null;
+  private requestedDebugPathfinding = false;
+  private requestedDebugPerf = false;
+  private requestedDebugCaravans = false;
+  private paused = false;
+  private dialoguePaused = false;
+  private pendingCameraFocus: { x: number; y: number } | null = null;
+  private pauseEl: HTMLElement | null = null;
+  private pauseHandlersBound = false;
+  private debugPathfindingUnits: Unit[] = [];
+  private debugPathfindingText: Phaser.GameObjects.Text | null = null;
+  private debugPathfindingNextLogMs = 0;
+  private debugPathfindingStartMs = 0;
+  private debugPerfText: Phaser.GameObjects.Text | null = null;
+  private debugPerfNextDrawMs = 0;
+  private perfFrameSamples: number[] = [];
+  private perfPathLastSampleMs = 0;
+  private perfPathLastCalls = 0;
+  private perfPathCallsPerSec = 0;
+  private fogLastMs = 0;
+  private fogAvgMs = 0;
+  private nextGroupMoveId = 1;
+  private repathsThisFrame = 0;
+  private unitSpatial = new SpatialIndex<Unit>(TILE * 3);
+  private unitSpatialReady = false;
+  private unitQueryScratch: Unit[] = [];
+  private skirmishStats: SkirmishStats = freshSkirmishStats();
+  private storyMapDefinition: StoryMapDefinition | null = null;
+  private storyController: StoryController | null = null;
+  private storyGroups = new Map<string, Set<number>>();
+  private storyRevealAreas: StoryRevealArea[] = [];
+  private storyLandmarks = new Map<string, Phaser.GameObjects.GameObject[]>();
+  private storyControlLockUntilMs = 0;
+  private storyAtmosphereTone: StoryAtmosphereTone = 'normal';
+  private storyAtmospherePersistentTone: StoryAtmosphereTone = 'normal';
+  private storyAtmosphereUntilMs = 0;
+  private storyAtmosphereOverlay: Phaser.GameObjects.Rectangle | null = null;
+
+  private onUiBuild = (kind: BuildingKind): void => this.beginPlacement(kind);
+  private onUiTrain = (kind: UnitKind): void => this.requestTrain(kind);
+  private onUiStop = (): void => this.commandStop();
+  private onUiCastTumanets = (): void => this.beginCastTumanets();
+  private onUiAutopilot = (): void => this.toggleAutopilotForSelection();
+  private onUiCenterTownhall = (): void => this.centerOnTownhall();
+  private onUiMinimapClick = (wx: number, wy: number): void => { this.centerCameraOn(wx, wy); };
+  private onStoryDialogueOpen = (): void => this.pauseForDialogue();
+  private onStoryDialogueClose = (): void => this.resumeFromDialogue();
+  private onWindowPointerMove = (ev: PointerEvent): void => this.updateDomCursorFromClient(ev.clientX, ev.clientY);
+  private onWindowBlur = (): void => this.setDomCursorVisible(false);
+
+  constructor() { super('GameScene'); }
+
+  init(data: GameInit): void {
+    this.requestedPerfSize = this.parsePerfScenarioSize(data?.debugPerfSize);
+    this.requestedDebugPathfinding = !!data?.debugPathfinding;
+    this.requestedDebugPerf = !!data?.debugPerf;
+    this.requestedDebugCaravans = !!data?.debugCaravans;
+    const config = this.normalizeLaunchConfig(data);
+    this.mode = config.mode;
+    this.playerRace = config.playerRace;
+    this.aiRace = this.playerRace === 'alliance' ? 'horde' : 'alliance';
+    this.difficulty = config.difficulty;
+    this.storyMapId = config.mode === 'story' ? config.storyMapId : null;
+    this.seed = config.seed ?? Math.floor(Math.random() * 100000);
+    this.launchConfig = { ...config, seed: this.seed };
+    this.units = []; this.buildings = []; this.resources = []; this.caravans = []; this.animals = [];
+    this.projectiles = []; this.selected = []; this.selectedBuilding = null;
+    this.selectionRings = []; this.buildingSelectionRing = null;
+    this.placementKind = null; this.placementGhost = null;
+    this.attackMoveMode = false; this.dragStart = null; this.panStart = null;
+    this.controlGroups = {}; this.gameOver = false;
+    this.lastUnderAttackMs = -9999;
+    this.lastClick = null;
+    this.caravanNextSpawnMs = Infinity;
+    this.simTimeMs = 0;
+    this.storyAtmosphereTone = 'normal';
+    this.storyAtmospherePersistentTone = 'normal';
+    this.storyAtmosphereUntilMs = 0;
+    this.storyAtmosphereOverlay = null;
+    this.caravanRouteFlip = false;
+    this.debugCaravans = false;
+    this.debugPathfinding = false;
+    this.debugPerf = false;
+    this.debugPerfSize = 100;
+    this.debugPathfindingUnits = [];
+    this.debugPathfindingText = null;
+    this.debugPathfindingNextLogMs = 0;
+    this.debugPathfindingStartMs = 0;
+    this.debugPerfText = null;
+    this.debugPerfNextDrawMs = 0;
+    this.perfFrameSamples = [];
+    this.perfPathLastSampleMs = 0;
+    this.perfPathLastCalls = 0;
+    this.perfPathCallsPerSec = 0;
+    this.fogLastMs = 0;
+    this.fogAvgMs = 0;
+    this.unitSpatialReady = false;
+    this.storyMapDefinition = null;
+    this.storyController = null;
+    this.storyGroups = new Map();
+    this.storyRevealAreas = [];
+    this.storyLandmarks = new Map();
+    this.storyControlLockUntilMs = 0;
+    this.nextGroupMoveId = 1;
+    this.repathsThisFrame = 0;
+    this.skirmishStats = freshSkirmishStats();
+    this.aiState = {
+      phase: 'economy',
+      nextCheckMs: 0,
+      armyTargetScore: DIFFICULTY[this.difficulty].attackScore,
+      regroupUntilMs: 0,
+      lastPressureMs: Number.NEGATIVE_INFINITY,
+      lastAttackOrderMs: Number.NEGATIVE_INFINITY,
+      lastDefenseOrderMs: Number.NEGATIVE_INFINITY,
+      lastCaravanOrderMs: Number.NEGATIVE_INFINITY
+    };
+    this.economy = new Economy();
+  }
+
+  private normalizeLaunchConfig(data: GameInit): GameLaunchConfig {
+    if (data?.mode === 'story') {
+      return {
+        mode: 'story',
+        playerRace: data.playerRace,
+        difficulty: data.difficulty,
+        storyMapId: data.storyMapId,
+        seed: data.seed
+      };
+    }
+    return {
+      mode: 'skirmish',
+      playerRace: data?.playerRace ?? 'alliance',
+      difficulty: data?.difficulty ?? 'normal',
+      seed: data?.seed
+    };
+  }
+
+  create(): void {
+    this.effects = new EffectsSystem(this);
+    this.audio = new AudioSystem(this);
+    this.debugPathfinding = this.requestedDebugPathfinding || this.isDebugPathfindingEnabled();
+    this.debugPerf = !this.debugPathfinding && (this.requestedDebugPerf || this.isDebugPerfEnabled());
+    this.debugPerfSize = this.requestedPerfSize ?? this.getDebugPerfSizeFromQuery();
+    this.storyMapDefinition = this.mode === 'story' && !this.debugPathfinding && !this.debugPerf && this.storyMapId
+      ? createStoryMap(this.storyMapId, this.seed)
+      : null;
+    this.layout = this.debugPathfinding
+      ? this.createDebugPathfindingLayout()
+      : this.debugPerf
+        ? this.createDebugPerfLayout()
+        : this.storyMapDefinition?.layout ?? generateMap(this.seed);
+    this.map = this.layout.map;
+
+    this.cameras.main.setBounds(0, 0, WORLD_W, WORLD_H);
+    this.cameras.main.setZoom(CAMERA_ZOOM);
+    this.cameras.main.setBackgroundColor(hexColor(COLORS.grass));
+    this.effects.setupPostFX();
+    this.effects.setupVignette();
+    this.setupStoryAtmosphereOverlay();
+
+    const start = SKIRMISH_CONFIG.start;
+    const debugCap = this.debugPathfinding || this.debugPerf ? 1000 : 0;
+    if (this.storyMapDefinition) {
+      this.economy.register(
+        SIDE.player,
+        this.playerRace,
+        this.storyMapDefinition.playerEconomy.gold,
+        this.storyMapDefinition.playerEconomy.lumber,
+        this.storyMapDefinition.playerEconomy.foodCap ?? 0,
+        this.storyMapDefinition.playerEconomy.salt ?? 0,
+        this.storyMapDefinition.playerEconomy.food ?? 0
+      );
+      this.economy.register(
+        SIDE.ai,
+        this.aiRace,
+        this.storyMapDefinition.aiEconomy.gold,
+        this.storyMapDefinition.aiEconomy.lumber,
+        this.storyMapDefinition.aiEconomy.foodCap ?? 0,
+        this.storyMapDefinition.aiEconomy.salt ?? 0,
+        this.storyMapDefinition.aiEconomy.food ?? 0
+      );
+    } else {
+      this.economy.register(SIDE.player, this.playerRace, start.gold, start.lumber, debugCap, start.salt, start.food);
+      this.economy.register(SIDE.ai, this.aiRace, start.gold, start.lumber, debugCap, start.salt, start.food);
+    }
+    this.skirmishStats.startedAtMs = this.time.now;
+
+    this.drawTiles();
+    if (this.storyMapDefinition?.landmarks) this.createStoryLandmarks(this.storyMapDefinition.landmarks);
+    if (this.debugPathfinding) this.spawnDebugPathfindingScenario();
+    else if (this.debugPerf) this.spawnDebugPerfScenario(this.debugPerfSize);
+    else if (this.storyMapDefinition) {
+      this.spawnStoryInitial(this.storyMapDefinition);
+      this.centerOnTownhall();
+    }
+    else {
+      this.spawnInitial();
+      this.centerOnTownhall();
+    }
+    this.debugCaravans = this.requestedDebugCaravans || this.isDebugCaravansEnabled();
+    this.scheduleNextCaravan(true);
+
+    this.fog = new FogOfWar(this, this.map);
+    this.initialReveal();
+    this.fog.redraw();
+    this.applyVisibility();
+
+    this.selectionRect = this.add.graphics().setDepth(1200).setScrollFactor(0);
+    this.footprint = this.add.graphics().setDepth(510);
+    this.rallyGraphics = this.add.graphics().setDepth(75);
+
+    // DOM cursor: fixed to client coordinates, so camera zoom and canvas scaling cannot offset it.
+    this.input.setDefaultCursor('none');
+    this.setupDomCursor();
+    if (this.debugPathfinding) this.createDebugPathfindingOverlay();
+    if (this.debugPerf) this.createDebugPerfOverlay();
+
+    this.setupInput();
+
+    if (this.storyMapDefinition) this.storyController = new StoryController(this.storyMapDefinition, this.createStoryControllerApi());
+
+    this.scene.launch('UIScene', { playerSide: SIDE.player, launchConfig: this.launchConfig });
+    if (this.storyController) this.time.delayedCall(0, () => this.storyController?.start(this.simTimeMs));
+    if (this.debugPathfinding) this.startDebugPathfindingCommand();
+
+    // Ambient audio + music start once user has interacted (audioctx resumes on first sound)
+    this.input.once('pointerdown', () => {
+      this.audio.startAmbient();
+      this.audio.startMusic();
+    });
+
+    this.game.events.on('ui-build', this.onUiBuild);
+    this.game.events.on('ui-train', this.onUiTrain);
+    this.game.events.on('ui-stop', this.onUiStop);
+    this.game.events.on('ui-cast-tumanets', this.onUiCastTumanets);
+    this.game.events.on('ui-autopilot', this.onUiAutopilot);
+    this.game.events.on('ui-center-townhall', this.onUiCenterTownhall);
+    this.game.events.on('ui-minimap-click', this.onUiMinimapClick);
+    this.game.events.on('story-dialogue-open', this.onStoryDialogueOpen);
+    this.game.events.on('story-dialogue-close', this.onStoryDialogueClose);
+
+    this.setupPauseUi();
+
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
+      this.emitEntityHover(null);
+      this.game.events.off('ui-build', this.onUiBuild);
+      this.game.events.off('ui-train', this.onUiTrain);
+      this.game.events.off('ui-stop', this.onUiStop);
+      this.game.events.off('ui-cast-tumanets', this.onUiCastTumanets);
+      this.game.events.off('ui-autopilot', this.onUiAutopilot);
+      this.game.events.off('ui-center-townhall', this.onUiCenterTownhall);
+      this.game.events.off('ui-minimap-click', this.onUiMinimapClick);
+      this.game.events.off('story-dialogue-open', this.onStoryDialogueOpen);
+      this.game.events.off('story-dialogue-close', this.onStoryDialogueClose);
+      this.teardownPauseUi();
+      this.teardownDomCursor();
+      this.cancelPlacement();
+    });
+  }
+
+  private drawTiles(): void {
+    this.tileLayer = this.add.container(0, 0);
+    this.tileLayer.setDepth(0);
+    this.waterTiles = [];
+    for (let y = 0; y < this.map.h; y++) {
+      for (let x = 0; x < this.map.w; x++) {
+        const t = this.map.get(x, y);
+        const key = t === 4 /* Water */ ? 'tile_water_0' : this.map.tileTextureKey(t);
+        const s = this.add.image(x * TILE, y * TILE, key)
+          .setOrigin(0, 0)
+          .setDisplaySize(TILE, TILE);
+        this.tileLayer.add(s);
+        if (t === 4) this.waterTiles.push(s);
+      }
+    }
+    this.drawTileOverlays();
+    // Render decals above tiles
+    const decalContainer = this.add.container(0, 0);
+    decalContainer.setDepth(1);
+    for (const d of this.layout.decals) {
+      if (!this.textures.exists(d.key)) continue;
+      const img = this.add.image(d.x, d.y, d.key).setScale(d.scale * this.decalTextureScale(d.key)).setRotation(d.rotation);
+      decalContainer.add(img);
+    }
+    // Water animation tick
+    this.time.addEvent({
+      delay: 260,
+      loop: true,
+      callback: () => {
+        this.waterPhase = (this.waterPhase + 1) % 4;
+        const key = `tile_water_${this.waterPhase}`;
+        for (const t of this.waterTiles) t.setTexture(key);
+      }
+    });
+  }
+
+  private drawTileOverlays(): void {
+    const g = this.add.graphics().setDepth(2);
+    const treeSet = new Set(this.layout.trees.map((t) => `${t.tx},${t.ty}`));
+    const treeContainer = this.add.container(0, 0).setDepth(3);
+    const FOREST_TREE_DISPLAY = TILE * 1.5;
+    for (let y = 0; y < this.map.h; y++) {
+      for (let x = 0; x < this.map.w; x++) {
+        const t = this.map.get(x, y);
+        const wx = x * TILE;
+        const wy = y * TILE;
+        if (t === TileType.Water) {
+          this.drawWaterEdge(g, x, y, wx, wy);
+        } else if (t === TileType.Dirt) {
+          this.drawRoadEdge(g, x, y, wx, wy);
+        } else if (t === TileType.Forest) {
+          g.fillStyle(0x000000, 0.08);
+          g.fillRect(wx, wy + TILE - 4, TILE, 4);
+          // Декоративні дерева глибокого лісу — позаду прикордонного шару layout.trees
+          if (!treeSet.has(`${x},${y}`) && (x + y) % 2 === 0) {
+            const img = this.add.image(wx + TILE / 2, wy + TILE, 'tree')
+              .setOrigin(0.5, 0.9)
+              .setDisplaySize(FOREST_TREE_DISPLAY, FOREST_TREE_DISPLAY);
+            treeContainer.add(img);
+          }
+        }
+      }
+    }
+  }
+
+  private decalTextureScale(key: string): number {
+    if (!key.startsWith('decal_')) return 1;
+    const source = this.textures.get(key).getSourceImage() as { width?: number };
+    return source.width && source.width >= HI_RES_DECAL_MIN_WIDTH ? HI_RES_DECAL_SCALE : 1;
+  }
+
+  private drawWaterEdge(g: Phaser.GameObjects.Graphics, tx: number, ty: number, wx: number, wy: number): void {
+    const isWater = (x: number, y: number) => this.map.inBounds(x, y) && this.map.get(x, y) === TileType.Water;
+    g.fillStyle(0x12120c, 0.34);
+    g.lineStyle(1, 0xa7c8c2, 0.32);
+    if (!isWater(tx, ty - 1)) { g.fillRect(wx, wy, TILE, 3); g.lineBetween(wx + 2, wy + 3, wx + TILE - 2, wy + 3); }
+    if (!isWater(tx, ty + 1)) { g.fillRect(wx, wy + TILE - 3, TILE, 3); g.lineBetween(wx + 2, wy + TILE - 4, wx + TILE - 2, wy + TILE - 4); }
+    if (!isWater(tx - 1, ty)) { g.fillRect(wx, wy, 3, TILE); g.lineBetween(wx + 3, wy + 2, wx + 3, wy + TILE - 2); }
+    if (!isWater(tx + 1, ty)) { g.fillRect(wx + TILE - 3, wy, 3, TILE); g.lineBetween(wx + TILE - 4, wy + 2, wx + TILE - 4, wy + TILE - 2); }
+  }
+
+  private drawRoadEdge(g: Phaser.GameObjects.Graphics, tx: number, ty: number, wx: number, wy: number): void {
+    const isRoad = (x: number, y: number) => this.map.inBounds(x, y) && this.map.get(x, y) === TileType.Dirt;
+    g.lineStyle(2, 0x2c2116, 0.22);
+    if (!isRoad(tx, ty - 1)) g.lineBetween(wx, wy + 1, wx + TILE, wy + 1);
+    if (!isRoad(tx, ty + 1)) g.lineBetween(wx, wy + TILE - 2, wx + TILE, wy + TILE - 2);
+    if (!isRoad(tx - 1, ty)) g.lineBetween(wx + 1, wy, wx + 1, wy + TILE);
+    if (!isRoad(tx + 1, ty)) g.lineBetween(wx + TILE - 2, wy, wx + TILE - 2, wy + TILE);
+  }
+
+  private spawnInitial(): void {
+    const pb = this.layout.playerBase;
+    const ab = this.layout.aiBase;
+    const start = SKIRMISH_CONFIG.start;
+
+    const pth = this.spawnBuilding(pb.tx - 1, pb.ty - 1, start.mainBuilding, SIDE.player, this.playerRace, true);
+    const ath = this.spawnBuilding(ab.tx - 1, ab.ty - 1, start.mainBuilding, SIDE.ai, this.aiRace, true);
+
+    for (let i = 0; i < start.workers; i++) {
+      const x = pth.x + start.workerOffsetX + i * start.workerSpacingX;
+      this.spawnUnit(x, pth.y + start.workerOffsetY, 'worker', SIDE.player, this.playerRace);
+    }
+    for (let i = 0; i < start.workers; i++) {
+      const x = ath.x + start.workerOffsetX + i * start.workerSpacingX;
+      this.spawnUnit(x, ath.y + start.workerOffsetY, 'worker', SIDE.ai, this.aiRace);
+    }
+
+    // стартові бійці (козаки + сердюк) обом сторонам
+    let fi = 0;
+    for (const grp of start.fighters) {
+      for (let i = 0; i < grp.count; i++, fi++) {
+        const fx = start.workerOffsetX + fi * start.workerSpacingX;
+        const fy = start.workerOffsetY + 34;
+        this.spawnUnit(pth.x + fx, pth.y + fy, grp.kind, SIDE.player, this.playerRace);
+        this.spawnUnit(ath.x + fx, ath.y + fy, grp.kind, SIDE.ai, this.aiRace);
+      }
+    }
+
+    for (const m of this.layout.goldMines) {
+      const node = new ResourceNode(this, m.tx - 1, m.ty - 1, 'gold');
+      for (let dy = 0; dy < 3; dy++) for (let dx = 0; dx < 3; dx++) this.map.setWalkable(m.tx - 1 + dx, m.ty - 1 + dy, false);
+      this.resources.push(node);
+    }
+    for (const t of this.layout.trees) this.resources.push(new ResourceNode(this, t.tx, t.ty, 'lumber'));
+
+    this.spawnSaltDeposits(2);
+    this.spawnWildlife();
+  }
+
+  /** Story API: спавн звірини за сценарієм. Лігво стає домівкою для вовків поруч. */
+  private spawnStoryAnimals(animals: Array<{ kind: AnimalKind; x: number; y: number }>): void {
+    const dens: Animal[] = [];
+    const spawned: Animal[] = [];
+    for (const spec of animals) {
+      const a = new Animal(this, this.map, spec.x, spec.y, spec.kind);
+      a.setVisible(this.isVisibleEntity(a));
+      this.animals.push(a);
+      spawned.push(a);
+      if (spec.kind === 'wolf_den') dens.push(a);
+    }
+    // вовки прив'язуються до найближчого щойно поставленого лігва
+    for (const a of spawned) {
+      if (a.animalKind !== 'wolf' || dens.length === 0) continue;
+      let best = dens[0];
+      for (const d of dens) {
+        if (Math.hypot(d.x - a.x, d.y - a.y) < Math.hypot(best.x - a.x, best.y - a.y)) best = d;
+      }
+      if (Math.hypot(best.x - a.x, best.y - a.y) < TILE * 8) { a.homeX = best.x; a.homeY = best.y; }
+    }
+  }
+
+  /** Соляні джерела: 2x2, на відстані від баз. */
+  private spawnSaltDeposits(count: number): void {
+    const bases = [this.layout.playerBase, this.layout.aiBase];
+    let placed = 0;
+    for (let tries = 0; tries < 400 && placed < count; tries++) {
+      const tx = 4 + Math.floor(Math.random() * (MAP_W - 9));
+      const ty = 4 + Math.floor(Math.random() * (MAP_H - 9));
+      let ok = true;
+      for (let dy = -1; dy <= 2 && ok; dy++) for (let dx = -1; dx <= 2 && ok; dx++) {
+        if (!this.map.inBounds(tx + dx, ty + dy) || !this.map.isWalkable(tx + dx, ty + dy)) ok = false;
+      }
+      if (!ok) continue;
+      for (const b of bases) {
+        if (Math.hypot(b.tx - tx, b.ty - ty) < 14) { ok = false; break; }
+      }
+      if (!ok) continue;
+      const node = new ResourceNode(this, tx, ty, 'salt');
+      for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++) this.map.setWalkable(tx + dx, ty + dy, false);
+      this.resources.push(node);
+      placed++;
+    }
+  }
+
+  /** Дика звірина: стада оленів біля лісу, поодинокі вепрі. */
+  private spawnWildlife(): void {
+    const trees = this.resources.filter(r => r.resourceType === 'lumber');
+    if (trees.length === 0) return;
+    const bases = [this.layout.playerBase, this.layout.aiBase];
+    const spotNear = (anchor: ResourceNode): { x: number; y: number } | null => {
+      for (let i = 0; i < 24; i++) {
+        const ang = Math.random() * Math.PI * 2;
+        const dist = TILE * (2 + Math.random() * 3);
+        const x = anchor.x + Math.cos(ang) * dist;
+        const y = anchor.y + Math.sin(ang) * dist;
+        const tx = Math.floor(x / TILE);
+        const ty = Math.floor(y / TILE);
+        if (!this.map.inBounds(tx, ty) || !this.map.isWalkable(tx, ty)) continue;
+        if (bases.some(b => Math.hypot(b.tx - tx, b.ty - ty) < 11)) continue;
+        return { x, y };
+      }
+      return null;
+    };
+    // 3 стада оленів по 3
+    for (let herd = 0; herd < 3; herd++) {
+      const anchor = trees[Math.floor(Math.random() * trees.length)];
+      const spot = spotNear(anchor);
+      if (!spot) continue;
+      for (let i = 0; i < 3; i++) {
+        const a = new Animal(this, this.map, spot.x + (Math.random() - 0.5) * TILE * 2, spot.y + (Math.random() - 0.5) * TILE * 2, 'deer');
+        a.setVisible(false);
+        this.animals.push(a);
+      }
+    }
+    // 2 вепрі
+    for (let i = 0; i < 2; i++) {
+      const anchor = trees[Math.floor(Math.random() * trees.length)];
+      const spot = spotNear(anchor);
+      if (!spot) continue;
+      const a = new Animal(this, this.map, spot.x, spot.y, 'boar');
+      a.setVisible(false);
+      this.animals.push(a);
+    }
+    // вовче лігво зі зграєю — у глушині, далі від баз
+    for (let dens = 0, tries = 0; dens < 1 && tries < 60; tries++) {
+      const anchor = trees[Math.floor(Math.random() * trees.length)];
+      const spot = spotNear(anchor);
+      if (!spot) continue;
+      if (bases.some(b => Math.hypot(b.tx * TILE - spot.x, b.ty * TILE - spot.y) < TILE * 17)) continue;
+      const den = new Animal(this, this.map, spot.x, spot.y, 'wolf_den');
+      den.setVisible(false);
+      this.animals.push(den);
+      for (let w = 0; w < ANIMAL.denMaxWolves; w++) {
+        const ang = (w / ANIMAL.denMaxWolves) * Math.PI * 2;
+        const wolf = new Animal(this, this.map, spot.x + Math.cos(ang) * TILE * 1.4, spot.y + Math.sin(ang) * TILE * 1.4, 'wolf');
+        wolf.homeX = spot.x; wolf.homeY = spot.y;
+        wolf.setVisible(false);
+        this.animals.push(wolf);
+      }
+      dens++;
+    }
+  }
+
+  /** Смерть звіра: туша лишається на місці — селяни розбирають її на їжу. */
+  private onAnimalKilled(animal: Animal, show: boolean): void {
+    const def = ANIMAL[animal.animalKind];
+    const idx = this.animals.indexOf(animal);
+    if (idx >= 0) this.animals.splice(idx, 1);
+    const wasDen = animal.animalKind === 'wolf_den';
+    const ax = animal.x; const ay = animal.y;
+    animal.destroy();
+    this.emitStoryEvent({ type: 'animalKilled', animalKind: animal.animalKind, bySide: animal.killedBy?.side });
+    if (def.foodAmount > 0) {
+      const node = new ResourceNode(this, Math.floor(ax / TILE), Math.floor(ay / TILE), 'food', def.foodAmount);
+      this.resources.push(node);
+      node.sprite.setVisible(this.isVisibleEntity(node));
+      if (show) {
+        this.effects.fx.dustPuff(node.x, node.y, false);
+        if (animal.killedBy?.side === SIDE.player) {
+          this.effects.resourceText(node.x, node.y - 8, `${def.label}: здобич!`, 'food');
+          this.flashMessage('Здобич! Пошліть селянина розібрати тушу');
+        }
+      }
+      return;
+    }
+    if (wasDen && show) {
+      this.effects.fx.debrisBurst(ax, ay);
+      this.effects.fx.dustPuff(ax, ay, false);
+      if (animal.killedBy?.side === SIDE.player) this.flashMessage('Лігво розорене — вовки тут більше не плодяться');
+    }
+  }
+
+  private spawnStoryInitial(definition: StoryMapDefinition): void {
+    for (const start of definition.startingBuildings) {
+      this.spawnBuilding(
+        start.tx,
+        start.ty,
+        start.kind,
+        start.side,
+        start.race ?? (start.side === SIDE.player ? this.playerRace : this.aiRace),
+        start.instant ?? false
+      );
+    }
+    for (const start of definition.startingUnits) {
+      const u = this.spawnUnit(
+        start.x,
+        start.y,
+        start.kind,
+        start.side,
+        start.race ?? (start.side === SIDE.player ? this.playerRace : this.aiRace)
+      );
+      if (start.hpMul) { u.maxHp = Math.round(u.maxHp * start.hpMul); u.hp = u.maxHp; }
+      if (start.atkMul) u.atk = Math.round(u.atk * start.atkMul);
+      if (start.customName) { u.customName = start.customName; u.markAsHero(); }
+      if (start.groupId) {
+        let group = this.storyGroups.get(start.groupId);
+        if (!group) { group = new Set(); this.storyGroups.set(start.groupId, group); }
+        group.add(u.id);
+      }
+    }
+    for (const start of definition.startingResources) {
+      const node = new ResourceNode(this, start.tx, start.ty, start.type);
+      if (start.type === 'gold') {
+        for (let dy = 0; dy < node.tileH; dy++) {
+          for (let dx = 0; dx < node.tileW; dx++) this.map.setWalkable(start.tx + dx, start.ty + dy, false);
+        }
+      }
+      this.resources.push(node);
+    }
+  }
+
+  private createStoryControllerApi(): StoryControllerGameApi {
+    return {
+      getUnits: () => this.units.map((unit) => ({
+        id: unit.id,
+        side: unit.side,
+        unitKind: unit.unitKind,
+        x: unit.x,
+        y: unit.y,
+        alive: unit.alive
+      })),
+      getBuildings: () => this.buildings.map((building) => ({
+        id: building.id,
+        side: building.side,
+        buildingKind: building.buildingKind,
+        completed: building.completed,
+        alive: building.alive
+      })),
+      emitObjectives: (payload) => this.game.events.emit('story-objectives', payload),
+      emitDialogue: (payload) => this.game.events.emit('story-dialogue', payload),
+      focusCamera: (beat) => this.focusStoryCamera(beat),
+      showMessage: (text) => this.flashMessage(text),
+      playFx: (kind, x, y, label) => this.playStoryFx(kind, x, y, label),
+      setLandmarkVisible: (id, visible) => this.setStoryLandmarkVisible(id, visible),
+      setAtmosphere: (tone, durationMs) => this.setStoryAtmosphere(tone, durationMs),
+      revealArea: (x, y, radiusTiles) => this.revealStoryArea(x, y, radiusTiles),
+      spawnCaravan: (route) => this.spawnStoryCaravan(route),
+      spawnUnits: (groupId, units) => this.spawnStoryUnits(groupId, units),
+      commandGroup: (groupId, command) => this.commandStoryGroup(groupId, command),
+      getGroupUnits: (groupId) => this.getStoryGroupSnapshots(groupId),
+      grantResources: (side, gold, lumber, salt, food) => this.grantStoryResources(side, gold, lumber, salt, food),
+      spawnAnimals: (animals) => this.spawnStoryAnimals(animals),
+      getResourceCount: (side, resource) => Math.floor(this.economy.get(side)?.[resource] ?? 0),
+      retreatPlayerUnits: (count, kinds, x, y, radius, toX, toY, despawnAfterMs, label) => this.retreatPlayerUnits(count, kinds, x, y, radius, toX, toY, despawnAfterMs, label),
+      sacrificePlayerUnits: (count, kinds, x, y, radius, label) => this.sacrificePlayerUnits(count, kinds, x, y, radius, label),
+      damageOrDestroyBuilding: (side, kind, damage, destroy, x, y, radius) => this.damageOrDestroyStoryBuilding(side, kind, damage, destroy, x, y, radius),
+      setClock: (label, durationMs, icon) => this.game.events.emit('story-clock', { label, icon, endAtMs: this.simTimeMs + durationMs }),
+      clearClock: () => this.game.events.emit('story-clock-clear'),
+      setDayPhase: (phase) => this.game.events.emit('story-dayphase', { phase }),
+      endGame: (win, storyLines) => this.endStoryGame(win, storyLines)
+    };
+  }
+
+  private emitStoryEvent(event: StoryRuntimeEvent): void {
+    this.storyController?.handle(event, this.simTimeMs);
+  }
+
+  private setupStoryAtmosphereOverlay(): void {
+    const cam = this.cameras.main;
+    this.storyAtmosphereOverlay = this.add.rectangle(0, 0, cam.width, cam.height, 0xffd7a0, 1)
+      .setOrigin(0, 0)
+      .setScrollFactor(0)
+      .setDepth(1190)
+      .setAlpha(0.035)
+      .setBlendMode(Phaser.BlendModes.ADD);
+  }
+
+  private setStoryAtmosphere(tone: StoryAtmosphereTone, durationMs?: number): void {
+    this.storyAtmosphereTone = tone;
+    if (durationMs === undefined) {
+      this.storyAtmospherePersistentTone = tone;
+      this.storyAtmosphereUntilMs = 0;
+    } else {
+      this.storyAtmosphereUntilMs = this.simTimeMs + durationMs;
+    }
+    this.applyStoryAtmosphereTone(tone, 520);
+  }
+
+  private updateStoryAtmosphereOverlay(): void {
+    const overlay = this.storyAtmosphereOverlay;
+    if (!overlay) return;
+    const cam = this.cameras.main;
+    if (overlay.width !== cam.width || overlay.height !== cam.height) overlay.setSize(cam.width, cam.height);
+    if (this.storyAtmosphereUntilMs > 0 && this.simTimeMs >= this.storyAtmosphereUntilMs) {
+      this.storyAtmosphereUntilMs = 0;
+      this.storyAtmosphereTone = this.storyAtmospherePersistentTone;
+      this.applyStoryAtmosphereTone(this.storyAtmospherePersistentTone, 700);
+    }
+  }
+
+  private applyStoryAtmosphereTone(tone: StoryAtmosphereTone, duration: number): void {
+    const overlay = this.storyAtmosphereOverlay;
+    if (!overlay) return;
+    const spec = atmosphereSpec(tone);
+    overlay.setFillStyle(spec.color, 1);
+    overlay.setBlendMode(spec.blendMode);
+    this.tweens.killTweensOf(overlay);
+    this.tweens.add({
+      targets: overlay,
+      alpha: spec.alpha,
+      duration,
+      ease: 'Sine.easeOut'
+    });
+  }
+
+  private focusStoryCamera(beat: StoryCameraBeat): void {
+    const cam = this.cameras.main;
+    const zoom = cam.zoom || 1;
+    const viewW = cam.width / zoom;
+    const viewH = cam.height / zoom;
+    const scrollX = Phaser.Math.Clamp(beat.x - viewW / 2, 0, Math.max(0, WORLD_W - viewW));
+    const scrollY = Phaser.Math.Clamp(beat.y - viewH / 2, 0, Math.max(0, WORLD_H - viewH));
+    this.storyControlLockUntilMs = Math.max(this.storyControlLockUntilMs, this.time.now + (beat.lockMs ?? beat.durationMs ?? 600));
+    this.cameraVel.x = 0;
+    this.cameraVel.y = 0;
+    this.pendingCameraFocus = { x: scrollX, y: scrollY };
+    this.tweens.add({
+      targets: cam,
+      scrollX,
+      scrollY,
+      duration: beat.durationMs ?? 600,
+      ease: 'Sine.easeInOut',
+      onComplete: () => {
+        if (this.pendingCameraFocus && this.pendingCameraFocus.x === scrollX && this.pendingCameraFocus.y === scrollY) {
+          this.pendingCameraFocus = null;
+        }
+      }
+    });
+  }
+
+  private playStoryFx(kind: StoryFxKind, x: number, y: number, label?: string): void {
+    if (kind === 'marker') {
+      this.effects.commandMarker(x, y, 0xffd36a, 'rally', label);
+      return;
+    }
+    if (kind === 'smoke') {
+      const emitter = this.effects.fx.continuousSmoke(x, y, true);
+      this.time.delayedCall(4200, () => emitter.stop());
+      this.effects.fx.dustPuff(x, y + 8, true);
+      return;
+    }
+    if (kind === 'embers') {
+      this.effects.fx.emberBurst(x, y, 18);
+      return;
+    }
+    if (kind === 'ash') {
+      this.effects.fx.ashDrift(x, y, 12);
+      return;
+    }
+    if (kind === 'dust') {
+      this.effects.fx.dustPuff(x, y + 8, false);
+      this.effects.fx.ashDrift(x, y - 12, 4);
+      return;
+    }
+    if (kind === 'fire') {
+      this.effects.fx.explosion(x, y);
+      return;
+    }
+    if (kind === 'explosion') {
+      this.effects.buildingDestroyed(x, y, 0xff8a3d);
+      return;
+    }
+    if (kind === 'glow') {
+      this.effects.fx.glowBurst(x, y, 18);
+      this.effects.fx.magicBurst(x, y, 34);
+      this.effects.shockwave(x, y, 0xb76cff);
+      return;
+    }
+    this.effects.fx.ambientMist(x, y);
+  }
+
+  private createStoryLandmarks(landmarks: StoryLandmark[]): void {
+    for (const landmark of landmarks) {
+      const objects = this.drawStoryLandmark(landmark);
+      this.storyLandmarks.set(landmark.id, objects);
+      this.setStoryLandmarkVisible(landmark.id, landmark.visible ?? true);
+    }
+  }
+
+  private drawStoryLandmark(landmark: StoryLandmark): Phaser.GameObjects.GameObject[] {
+    const objects: Phaser.GameObjects.GameObject[] = [];
+    const add = (obj: Phaser.GameObjects.GameObject): void => { objects.push(obj); };
+    const { x, y } = landmark;
+    const color = landmark.color ?? 0xffd36a;
+    const scaled = (value: number): number => value * STORY_LANDMARK_SCALE;
+
+    if (landmark.kind === 'image') {
+      const key = landmark.textureKey && this.textures.exists(landmark.textureKey) ? landmark.textureKey : 'px_debris_1';
+      const w = scaled(landmark.displayWidth ?? 96);
+      const h = scaled(landmark.displayHeight ?? 96);
+      add(this.add.ellipse(x, y + h * 0.34, w * 0.82, h * 0.24, 0x000000, 0.32).setDepth(7));
+      const img = this.add.image(x, y, key).setDepth(8 + y / 10000).setOrigin(0.5, 0.62);
+      img.setDisplaySize(w, h);
+      img.setData('entity', null);
+      add(img);
+      if (!landmark.hideLabel) add(this.storyLandmarkLabel(landmark.label, x, y - h * 0.55, color));
+      return objects;
+    }
+    if (landmark.kind === 'actor') {
+      add(this.add.ellipse(x, y + scaled(16), scaled(34), scaled(12), 0x000000, 0.45).setDepth(27));
+      const kind = landmark.unitKind ?? 'footman';
+      const race = landmark.race ?? this.playerRace;
+      const key = unitSheetKey(kind, race, 'idle');
+      if (this.textures.exists(key)) {
+        const actor = this.add.sprite(x, y, key, 0).setDepth(31).setOrigin(0.5, 0.58);
+        actor.setDisplaySize(scaled(UNIT_ART_DISPLAY[kind].width), scaled(UNIT_ART_DISPLAY[kind].height));
+        actor.setData('entity', null);
+        add(actor);
+      } else {
+        add(this.add.ellipse(x, y, scaled(22), scaled(30), color, 0.85).setDepth(31));
+      }
+      add(this.storyLandmarkLabel(landmark.label, x, y - scaled(34), color));
+      return objects;
+    }
+
+    if (landmark.kind === 'burnedRoad') {
+      this.addLandmarkImage(objects, 'decal_dirt_patch', x, y + scaled(20), scaled(2.6), 0.08, 0x5a4331, 8);
+      this.addLandmarkImage(objects, 'decal_rock_pile', x - scaled(44), y + scaled(18), scaled(1.35), -0.18, 0x6f6256, 10);
+      this.addLandmarkImage(objects, 'decal_twig', x + scaled(48), y - scaled(4), scaled(2.0), 0.5, 0x2d2119, 10);
+      const caravanKey = caravanSheetKey('idle');
+      if (this.textures.exists(caravanKey)) {
+        const cart = this.add.sprite(x + scaled(8), y, caravanKey, 0).setDepth(18).setRotation(-0.2).setAlpha(0.82).setTint(0x5f4b3c);
+        cart.setDisplaySize(scaled(CARAVAN_ART_DISPLAY.width * 0.86), scaled(CARAVAN_ART_DISPLAY.height * 0.86));
+        cart.setData('entity', null);
+        add(cart);
+      }
+      add(this.storyLandmarkLabel(landmark.label, x, y - scaled(48), color));
+      return objects;
+    }
+
+    if (landmark.kind === 'chapel') {
+      const ring = this.add.graphics().setDepth(12);
+      ring.lineStyle(scaled(3), 0x8f8170, 0.86);
+      ring.strokeCircle(x, y + scaled(8), scaled(58));
+      ring.lineStyle(scaled(2), 0x2a2119, 0.55);
+      ring.lineBetween(x - scaled(54), y + scaled(8), x + scaled(54), y + scaled(8));
+      ring.lineBetween(x, y - scaled(46), x, y + scaled(62));
+      add(ring);
+      const towerKey = buildingSheetKey('tower', 'alliance');
+      if (this.textures.exists(towerKey)) {
+        const ruin = this.add.sprite(x, y - scaled(6), towerKey, getBuildingStageFrame('ruin')).setDepth(18).setAlpha(0.9).setTint(0x9c8c78);
+        ruin.setDisplaySize(scaled(BUILDING_ART_DISPLAY.tower.width * 0.78), scaled(BUILDING_ART_DISPLAY.tower.height * 0.78));
+        ruin.setData('entity', null);
+        add(ruin);
+      }
+      this.addLandmarkImage(objects, 'decal_rock_pile', x - scaled(52), y + scaled(38), scaled(1.25), -0.08, 0x80766b, 19);
+      this.addLandmarkImage(objects, 'decal_rock_pile', x + scaled(48), y + scaled(30), scaled(1.15), 0.18, 0x80766b, 19);
+      add(this.storyLandmarkLabel(landmark.label, x, y - scaled(74), color));
+      return objects;
+    }
+
+    if (landmark.kind === 'crownSeal' || landmark.kind === 'choiceObelisk') {
+      const seal = this.add.graphics().setDepth(16);
+      seal.lineStyle(scaled(3), color, landmark.kind === 'crownSeal' ? 0.78 : 0.9);
+      seal.strokeCircle(x, y, scaled(landmark.kind === 'crownSeal' ? 48 : 30));
+      seal.lineStyle(scaled(1.5), 0x170d08, 0.85);
+      seal.strokeCircle(x, y, scaled(landmark.kind === 'crownSeal' ? 34 : 20));
+      seal.lineBetween(x - scaled(24), y, x + scaled(24), y);
+      seal.lineBetween(x, y - scaled(24), x, y + scaled(24));
+      add(seal);
+      this.addLandmarkImage(objects, 'px_rune', x, y, scaled(landmark.kind === 'crownSeal' ? 1.8 : 1.25), 0, color, 17);
+      this.addLandmarkImage(objects, 'decal_rock_pile', x - scaled(24), y + scaled(28), scaled(0.9), -0.2, 0x6f6256, 18);
+      this.addLandmarkImage(objects, 'decal_rock_pile', x + scaled(28), y + scaled(24), scaled(0.75), 0.16, 0x6f6256, 18);
+      add(this.storyLandmarkLabel(landmark.label, x, y - scaled(landmark.kind === 'crownSeal' ? 58 : 42), color));
+      return objects;
+    }
+
+    add(this.storyLandmarkLabel(landmark.label, x, y - scaled(28), color));
+    return objects;
+  }
+
+  private addLandmarkImage(
+    objects: Phaser.GameObjects.GameObject[],
+    key: string,
+    x: number,
+    y: number,
+    scale: number,
+    rotation: number,
+    tint: number,
+    depth: number
+  ): void {
+    if (!this.textures.exists(key)) return;
+    const image = this.add.image(x, y, key).setScale(scale).setRotation(rotation).setTint(tint).setDepth(depth);
+    image.setData('entity', null);
+    objects.push(image);
+  }
+
+  private storyLandmarkLabel(text: string, x: number, y: number, color: number): Phaser.GameObjects.Text {
+    return this.add.text(x, y, text, {
+      fontFamily: 'serif',
+      fontSize: '12px',
+      color: hexColor(color),
+      backgroundColor: 'rgba(16, 11, 8, 0.76)',
+      padding: { x: 6, y: 3 }
+    }).setOrigin(0.5).setDepth(44).setStroke('#000000', 3);
+  }
+
+  private setStoryLandmarkVisible(id: string, visible: boolean): void {
+    const objects = this.storyLandmarks.get(id);
+    if (!objects) return;
+    for (const object of objects) {
+      if ('setVisible' in object) (object as unknown as { setVisible(value: boolean): void }).setVisible(visible);
+    }
+  }
+
+  private revealStoryArea(x: number, y: number, radiusTiles: number): void {
+    if (!this.fog) return;
+    const tile = this.map.worldToTile(x, y);
+    const existing = this.storyRevealAreas.find((area) => area.tx === tile.tx && area.ty === tile.ty);
+    if (existing) existing.radiusTiles = Math.max(existing.radiusTiles, radiusTiles);
+    else this.storyRevealAreas.push({ tx: tile.tx, ty: tile.ty, radiusTiles });
+    this.applyStoryReveals();
+    this.fog.redraw();
+    this.applyVisibility();
+  }
+
+  private applyStoryReveals(): void {
+    if (!this.fog) return;
+    for (const area of this.storyRevealAreas) {
+      this.fog.revealCircle(area.tx, area.ty, area.radiusTiles);
+    }
+  }
+
+  private spawnStoryCaravan(route: { x: number; y: number }[]): Caravan {
+    const caravan = new Caravan(this, route);
+    this.caravans.push(caravan);
+    this.effects.fx.dustPuff(caravan.x, caravan.y + caravan.radius * 0.45, true);
+    caravan.setVisible(this.isVisibleEntity(caravan));
+    return caravan;
+  }
+
+  private spawnStoryUnits(groupId: string, starts: StoryScriptedUnit[]): void {
+    const group = this.storyGroups.get(groupId) ?? new Set<number>();
+    this.storyGroups.set(groupId, group);
+    for (const start of starts) {
+      const race = start.race ?? (start.side === SIDE.player ? this.playerRace : this.aiRace);
+      const unit = this.spawnUnit(start.x, start.y, start.kind, start.side, race);
+      if (start.side === SIDE.ai) {
+        const mul = this.storyMapDefinition?.enemyStatMultiplier;
+        if (mul?.hp) { unit.maxHp = Math.round(unit.maxHp * mul.hp); unit.hp = unit.maxHp; }
+        if (mul?.atk) unit.atk = Math.round(unit.atk * mul.atk);
+      }
+      if (start.speedMul) unit.speed *= start.speedMul;
+      group.add(unit.id);
+      this.effects.unitSpawn(start.x, start.y, RACE_COLOR[race]);
+      unit.setVisible(this.isVisibleEntity(unit));
+    }
+  }
+
+  private commandStoryGroup(groupId: string, command: StoryGroupCommand): void {
+    const units = this.getStoryGroupUnits(groupId).filter((unit) => unit.alive);
+    if (units.length === 0) return;
+    switch (command.type) {
+      case 'move':
+        this.orderMoveGroup(units, command.x, command.y);
+        break;
+      case 'attackMove':
+        this.orderAttackMoveGroup(units.filter((unit) => unit.canAttack()), command.x, command.y);
+        break;
+      case 'attackCaravan': {
+        const caravan = this.caravans.find((candidate) => candidate.alive);
+        if (!caravan) return;
+        for (const unit of units) this.orderAttack(unit, caravan);
+        break;
+      }
+      case 'attackTownhall': {
+        const hall = this.findPlayerTownhall();
+        if (hall) this.orderAttackMoveGroup(units.filter((unit) => unit.canAttack()), hall.x, hall.y);
+        break;
+      }
+      case 'retreat':
+        this.orderMoveGroup(units, command.x, command.y);
+        if (command.despawnAfterMs !== undefined) {
+          this.time.delayedCall(command.despawnAfterMs, () => this.despawnStoryGroup(groupId));
+        }
+        break;
+      case 'despawn':
+        this.despawnStoryGroup(groupId);
+        break;
+    }
+  }
+
+  private getStoryGroupUnits(groupId: string): Unit[] {
+    const group = this.storyGroups.get(groupId);
+    if (!group) return [];
+    return this.units.filter((unit) => group.has(unit.id));
+  }
+
+  private getStoryGroupSnapshots(groupId: string): StoryUnitSnapshot[] {
+    return this.getStoryGroupUnits(groupId).map((unit) => ({
+      id: unit.id,
+      side: unit.side,
+      unitKind: unit.unitKind,
+      x: unit.x,
+      y: unit.y,
+      alive: unit.alive
+    }));
+  }
+
+  private despawnStoryGroup(groupId: string): void {
+    for (const unit of this.getStoryGroupUnits(groupId)) this.removeStoryUnitQuietly(unit);
+    this.storyGroups.delete(groupId);
+  }
+
+  private grantStoryResources(side: Side, gold = 0, lumber = 0, salt = 0, food = 0): void {
+    if (gold) this.economy.deposit(side, 'gold', gold);
+    if (lumber) this.economy.deposit(side, 'lumber', lumber);
+    if (salt) this.economy.deposit(side, 'salt', salt);
+    if (food) this.economy.deposit(side, 'food', food);
+    if (side !== SIDE.player) return;
+    const hall = this.findPlayerTownhall();
+    const x = hall?.x ?? this.cameras.main.midPoint.x;
+    const y = hall?.y ?? this.cameras.main.midPoint.y;
+    if (gold) this.effects.resourceText(x - 12, y - 12, `+${gold} З`, 'gold');
+    if (lumber) this.effects.resourceText(x + 12, y + 8, `+${lumber} Д`, 'lumber');
+    if (salt) this.effects.resourceText(x - 12, y + 24, `+${salt} С`, 'salt');
+    if (food) this.effects.resourceText(x + 12, y + 40, `+${food} Ї`, 'food');
+    this.audio.play('deposit', 0.55);
+  }
+
+  private retreatPlayerUnits(
+    count: number,
+    kinds: UnitKind[] | undefined,
+    x: number | undefined,
+    y: number | undefined,
+    radius: number | undefined,
+    toX: number,
+    toY: number,
+    despawnAfterMs = 4200,
+    label = 'Leaving'
+  ): void {
+    const units = this.pickPlayerUnitsForStory(count, kinds, x, y, radius);
+    for (const unit of units) {
+      unit.autopilot = false;
+      unit.autopilotAnchor = null;
+      this.effects.statusText(unit.x, unit.y - 24, label, 0xffd36a);
+      this.orderMove(unit, toX, toY);
+    }
+    if (units.length === 0) return;
+    this.time.delayedCall(despawnAfterMs, () => {
+      for (const unit of units) {
+        if (unit.alive) this.removeStoryUnitQuietly(unit);
+      }
+    });
+  }
+
+  private sacrificePlayerUnits(count: number, kinds?: UnitKind[], x?: number, y?: number, radius?: number, label?: string): void {
+    for (const unit of this.pickPlayerUnitsForStory(count, kinds, x, y, radius)) {
+      this.effects.fx.magicBurst(unit.x, unit.y - 8, 18);
+      this.effects.statusText(unit.x, unit.y - 24, label ?? 'Taken', 0xb76cff);
+      this.dealDamage(unit, unit.hp + 999, undefined, true);
+    }
+  }
+
+  private pickPlayerUnitsForStory(count: number, kinds?: UnitKind[], x?: number, y?: number, radius?: number): Unit[] {
+    return this.units
+      .filter((unit) => unit.alive && unit.side === SIDE.player)
+      .filter((unit) => !kinds || kinds.includes(unit.unitKind))
+      .filter((unit) => x === undefined || y === undefined || radius === undefined || Phaser.Math.Distance.Between(unit.x, unit.y, x, y) <= radius)
+      .sort((a, b) => {
+        const rank = unitSacrificeRank(a) - unitSacrificeRank(b);
+        if (rank !== 0) return rank;
+        if (x === undefined || y === undefined) return a.id - b.id;
+        return Phaser.Math.Distance.Between(a.x, a.y, x, y) - Phaser.Math.Distance.Between(b.x, b.y, x, y);
+      })
+      .slice(0, count);
+  }
+
+  private damageOrDestroyStoryBuilding(
+    side: Side,
+    kind?: BuildingKind,
+    damage = 0,
+    destroy = false,
+    x?: number,
+    y?: number,
+    radius?: number
+  ): void {
+    const candidates = this.buildings
+      .filter((building) => building.alive && building.side === side)
+      .filter((building) => !kind || building.buildingKind === kind)
+      .filter((building) => x === undefined || y === undefined || radius === undefined || Phaser.Math.Distance.Between(building.x, building.y, x, y) <= radius)
+      .sort((a, b) => {
+        if (x === undefined || y === undefined) return 0;
+        return Phaser.Math.Distance.Between(a.x, a.y, x, y) - Phaser.Math.Distance.Between(b.x, b.y, x, y);
+      });
+    const building = candidates[0];
+    if (!building) return;
+    const amount = destroy ? building.hp + 999 : damage;
+    if (amount <= 0) return;
+    this.dealDamage(building, amount, undefined, true);
+  }
+
+  private findPlayerTownhall(): Building | null {
+    return this.buildings.find((building) => (
+      building.alive
+      && building.side === SIDE.player
+      && building.buildingKind === 'townhall'
+    )) ?? null;
+  }
+
+  private removeStoryUnitQuietly(unit: Unit): void {
+    if (!unit.alive) return;
+    unit.alive = false;
+    unit.clearOrders();
+    unit.hb.destroy();
+    unit.sprite.destroy();
+    unit.shadow.destroy();
+    unit.weapon?.destroy();
+  }
+
+  private endStoryGame(win: boolean, storyLines: string[] = []): void {
+    if (this.gameOver) return;
+    this.gameOver = true;
+    const color = win ? 0x44ff88 : 0xff4444;
+    const mid = this.cameras.main.midPoint;
+    this.effects.shockwave(mid.x, mid.y, color);
+    this.cameras.main.flash(500, (color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff);
+    this.cameras.main.shake(700, 0.012);
+    this.audio.play(win ? 'victory' : 'defeat', 1);
+    this.tweens.timeScale = 0.35;
+    window.setTimeout(() => {
+      this.tweens.timeScale = 1;
+      const payload: GameOverPayload = {
+        win,
+        story: {
+          title: win ? 'Пепельная победа' : 'Граница пала',
+          lines: storyLines.length > 0 ? storyLines : [
+            win
+              ? 'Ратуша устояла, но пепел еще долго будет находить имена на ветру.'
+              : 'Последние огни деревни погасли раньше рассвета.'
+          ]
+        }
+      };
+      this.game.events.emit('game-over', payload);
+    }, 1400);
+  }
+
+  private isDebugCaravansEnabled(): boolean {
+    if (typeof window === 'undefined') return false;
+    return new URLSearchParams(window.location.search).get('debugCaravans') === '1';
+  }
+
+  private isDebugPathfindingEnabled(): boolean {
+    if (typeof window === 'undefined') return false;
+    return new URLSearchParams(window.location.search).get('debugPathfinding') === '1';
+  }
+
+  private isDebugPerfEnabled(): boolean {
+    if (typeof window === 'undefined') return false;
+    const value = new URLSearchParams(window.location.search).get('debugPerf');
+    return value === '1' || value === '100' || value === '300' || value === '500';
+  }
+
+  private getDebugPerfSizeFromQuery(): PerfScenarioSize {
+    if (typeof window === 'undefined') return 100;
+    return this.parsePerfScenarioSize(new URLSearchParams(window.location.search).get('debugPerf')) ?? 100;
+  }
+
+  private parsePerfScenarioSize(value: unknown): PerfScenarioSize | null {
+    if (value === 100 || value === '100') return 100;
+    if (value === 300 || value === '300') return 300;
+    if (value === 500 || value === '500') return 500;
+    return null;
+  }
+
+  private createDebugPathfindingLayout(): MapLayout {
+    const map = new TileMap();
+    for (let y = 0; y < map.h; y++) {
+      for (let x = 0; x < map.w; x++) {
+        map.set(x, y, (x + y) % 2 === 0 ? TileType.Grass : TileType.Grass2);
+      }
+    }
+
+    const gateMinY = 30;
+    const gateMaxY = 32;
+    for (let y = 6; y < map.h - 6; y++) {
+      if (y >= gateMinY && y <= gateMaxY) continue;
+      map.set(31, y, TileType.Stone);
+      map.set(32, y, TileType.Stone);
+    }
+
+    for (let x = 8; x <= 56; x++) {
+      for (let y = gateMinY; y <= gateMaxY; y++) {
+        map.set(x, y, TileType.Dirt);
+        map.setWalkable(x, y, true);
+      }
+    }
+    for (let y = 21; y <= 42; y++) {
+      for (let x = 6; x <= 21; x++) {
+        map.set(x, y, TileType.Dirt);
+        map.setWalkable(x, y, true);
+      }
+      for (let x = 43; x <= 58; x++) {
+        map.set(x, y, TileType.Dirt);
+        map.setWalkable(x, y, true);
+      }
+    }
+
+    return {
+      map,
+      playerBase: { tx: 12, ty: 32 },
+      aiBase: { tx: 53, ty: 32 },
+      goldMines: [],
+      trees: [],
+      decals: []
+    };
+  }
+
+  private createDebugPerfLayout(): MapLayout {
+    const map = new TileMap();
+    for (let y = 0; y < map.h; y++) {
+      for (let x = 0; x < map.w; x++) {
+        map.set(x, y, (x + y) % 2 === 0 ? TileType.Grass : TileType.Grass2);
+        map.setWalkable(x, y, true);
+      }
+    }
+    for (let y = 24; y <= 40; y++) {
+      for (let x = 8; x <= 56; x++) map.set(x, y, TileType.Dirt);
+    }
+    return {
+      map,
+      playerBase: { tx: 16, ty: 32 },
+      aiBase: { tx: 48, ty: 32 },
+      goldMines: [],
+      trees: [],
+      decals: []
+    };
+  }
+
+  private spawnDebugPathfindingScenario(): void {
+    resetPathfindingStats();
+    this.debugPathfindingUnits = [];
+    const startX = 10 * TILE + TILE / 2;
+    const startY = 31 * TILE + TILE / 2;
+    const cols = 10;
+    const rows = 6;
+    const spacingX = 24;
+    const spacingY = 24;
+    for (let row = 0; row < rows; row++) {
+      for (let col = 0; col < cols; col++) {
+        const x = startX + (col - (cols - 1) / 2) * spacingX;
+        const y = startY + (row - (rows - 1) / 2) * spacingY;
+        this.debugPathfindingUnits.push(this.spawnUnit(x, y, 'footman', SIDE.player, this.playerRace));
+      }
+    }
+    this.selected = this.debugPathfindingUnits.slice();
+    this.cameras.main.centerOn(startX + TILE * 8, startY);
+  }
+
+  private spawnDebugPerfScenario(totalUnits: PerfScenarioSize): void {
+    resetPathfindingStats();
+    resetHealthBarStats();
+    this.perfFrameSamples = [];
+    this.perfPathLastSampleMs = this.time.now;
+    this.perfPathLastCalls = 0;
+    this.perfPathCallsPerSec = 0;
+    this.fogLastMs = 0;
+    this.fogAvgMs = 0;
+
+    const perSide = Math.floor(totalUnits / 2);
+    const cols = Math.ceil(Math.sqrt(perSide));
+    const spacingX = 26;
+    const spacingY = 24;
+    const centerY = WORLD_H / 2;
+    const playerCenterX = WORLD_W * 0.31;
+    const aiCenterX = WORLD_W * 0.69;
+    const playerUnits: Unit[] = [];
+    const aiUnits: Unit[] = [];
+
+    for (let i = 0; i < perSide; i++) {
+      const row = Math.floor(i / cols);
+      const col = i % cols;
+      const ox = (col - (cols - 1) / 2) * spacingX;
+      const oy = (row - Math.floor(perSide / cols) / 2) * spacingY;
+      const kind = PERF_UNIT_MIX[i % PERF_UNIT_MIX.length];
+      playerUnits.push(this.spawnUnit(playerCenterX + ox, centerY + oy, kind, SIDE.player, this.playerRace));
+      aiUnits.push(this.spawnUnit(aiCenterX - ox, centerY + oy, kind, SIDE.ai, this.aiRace));
+    }
+
+    this.selected = [];
+    this.selectedBuilding = null;
+    this.cameras.main.centerOn(WORLD_W / 2, WORLD_H / 2);
+    this.rebuildUnitSpatialIndex();
+    this.orderAttackMoveGroup(playerUnits, aiCenterX, centerY);
+    this.orderAttackMoveGroup(aiUnits, playerCenterX, centerY);
+    console.log(`[perf-debug] scenario=${totalUnits} units player=${playerUnits.length} ai=${aiUnits.length}`);
+  }
+
+  private createDebugPathfindingOverlay(): void {
+    this.debugPathfindingText = this.add.text(12, 86, '', {
+      fontFamily: 'monospace',
+      fontSize: '12px',
+      color: '#d9ffe0',
+      backgroundColor: 'rgba(0, 0, 0, 0.68)'
+    }).setScrollFactor(0).setDepth(2001).setPadding(8);
+  }
+
+  private createDebugPerfOverlay(): void {
+    this.debugPerfText = this.add.text(12, 86, '', {
+      fontFamily: 'monospace',
+      fontSize: '12px',
+      color: '#d9ffe0',
+      backgroundColor: 'rgba(0, 0, 0, 0.72)'
+    }).setScrollFactor(0).setDepth(2001).setPadding(8);
+  }
+
+  private startDebugPathfindingCommand(): void {
+    this.time.delayedCall(250, () => {
+      const units = this.debugPathfindingUnits.filter(u => u.alive);
+      if (units.length === 0) return;
+      this.selected = units;
+      this.updateSelectionRings();
+      resetPathfindingStats();
+      this.debugPathfindingStartMs = this.time.now;
+      this.debugPathfindingNextLogMs = this.time.now;
+      const target = { x: 54 * TILE + TILE / 2, y: 31 * TILE + TILE / 2 };
+      this.orderMoveGroup(units, target.x, target.y);
+      this.effects.commandMarker(target.x, target.y, 0x66ff66, 'move', 'Debug');
+    });
+  }
+
+  private caravanSpawnsEnabled(): boolean {
+    if (this.debugPathfinding) return false;
+    if (this.debugPerf) return false;
+    if (this.mode === 'skirmish') return SKIRMISH_CONFIG.caravans.enabled && CARAVAN_CONFIG.enabledInSkirmish;
+    return CARAVAN_CONFIG.enabledInStory;
+  }
+
+  private scheduleNextCaravan(first = false): void {
+    if (!this.caravanSpawnsEnabled()) {
+      this.caravanNextSpawnMs = Infinity;
+      return;
+    }
+    const range = this.debugCaravans
+      ? CARAVAN_CONFIG.debugSpawnMs
+      : first
+        ? CARAVAN_CONFIG.firstSpawnMs
+        : CARAVAN_CONFIG.repeatSpawnMs;
+    this.caravanNextSpawnMs = this.time.now + Phaser.Math.Between(range.min, range.max);
+  }
+
+  private spawnCaravan(): Caravan {
+    const caravan = new Caravan(this, this.createCaravanRoute());
+    this.caravans.push(caravan);
+    this.effects.fx.dustPuff(caravan.x, caravan.y + caravan.radius * 0.45, true);
+    caravan.setVisible(this.isVisibleEntity(caravan));
+    return caravan;
+  }
+
+  private createCaravanRoute(): { x: number; y: number }[] {
+    const lower = { x: 10 * TILE + TILE / 2, y: WORLD_H - 13 * TILE + TILE / 2 };
+    const center = { x: WORLD_W / 2, y: WORLD_H / 2 };
+    const upper = { x: WORLD_W - 12 * TILE + TILE / 2, y: 12 * TILE + TILE / 2 };
+    const margin = CARAVAN_CONFIG.radius * 3;
+    const fromLower = this.caravanRouteFlip;
+    this.caravanRouteFlip = !this.caravanRouteFlip;
+    return fromLower
+      ? [{ x: -margin, y: lower.y }, lower, center, upper, { x: WORLD_W + margin, y: upper.y }]
+      : [{ x: WORLD_W + margin, y: upper.y }, upper, center, lower, { x: -margin, y: lower.y }];
+  }
+
+  spawnUnit(x: number, y: number, kind: UnitKind, side: Side, race: Race): Unit {
+    const u = new Unit(this, x, y, kind, side, race);
+    this.units.push(u);
+    this.economy.addPop(side, u.food);
+    return u;
+  }
+
+  spawnBuilding(tx: number, ty: number, kind: BuildingKind, side: Side, race: Race, instant = false): Building {
+    const b = new Building(this, tx, ty, kind, side, race, instant);
+    this.buildings.push(b);
+    const def = BUILDING[kind];
+    for (let dy = 0; dy < def.size; dy++) {
+      for (let dx = 0; dx < def.size; dx++) this.map.setWalkable(tx + dx, ty + dy, false);
+    }
+    this.vacateFootprint(tx, ty, def.size);
+    if (instant && (kind === 'townhall' || kind === 'farm')) this.economy.addCap(side, def.food);
+    return b;
+  }
+
+  /** Виштовхує юнітів, що стоять на клітинках під новозбудованою спорудою, на найближчу вільну клітинку поруч. */
+  private vacateFootprint(tx: number, ty: number, size: number): void {
+    const x0 = tx, x1 = tx + size - 1, y0 = ty, y1 = ty + size - 1;
+    for (const u of this.units) {
+      if (!u.alive) continue;
+      const ut = this.tileFromWorld(u.x, u.y);
+      if (ut.tx < x0 || ut.tx > x1 || ut.ty < y0 || ut.ty > y1) continue;
+
+      let best: { tx: number; ty: number } | null = null;
+      let bestDist = Infinity;
+      for (let ry = y0 - 1; ry <= y1 + 1; ry++) {
+        for (let rx = x0 - 1; rx <= x1 + 1; rx++) {
+          const onRing = rx < x0 || rx > x1 || ry < y0 || ry > y1;
+          if (!onRing) continue;
+          if (!this.map.inBounds(rx, ry) || !this.map.isWalkable(rx, ry)) continue;
+          const dist = (rx - ut.tx) * (rx - ut.tx) + (ry - ut.ty) * (ry - ut.ty);
+          if (dist < bestDist) { bestDist = dist; best = { tx: rx, ty: ry }; }
+        }
+      }
+      if (best) {
+        u.x = best.tx * TILE + TILE / 2;
+        u.y = best.ty * TILE + TILE / 2;
+      }
+    }
+  }
+
+  private setupInput(): void {
+    const kb = this.input.keyboard!;
+    this.cursorKeys = kb.createCursorKeys();
+    this.wasdKeys = kb.addKeys('W,A,S,D') as any;
+    kb.on('keydown-Q', () => this.setAttackMoveMode(true));
+    kb.on('keydown-T', () => this.beginCastTumanets());
+    kb.on('keydown-X', () => this.commandStop());
+    kb.on('keydown-H', () => this.centerOnTownhall());
+    kb.on('keydown-R', () => this.restartGame());
+    kb.on('keydown-M', () => this.flashMessage(this.audio.toggleMute() ? 'Звук выключен' : 'Звук включен'));
+    kb.on('keydown-ESC', () => {
+      if (this.placementKind) { this.cancelPlacement(); return; }
+      if (this.castTumanetsMode) { this.setCastTumanetsMode(false); return; }
+      if (this.attackMoveMode) { this.setAttackMoveMode(false); return; }
+      this.togglePause();
+    });
+    kb.on('keydown-B', () => this.game.events.emit('ui-open-build'));
+    kb.on('keydown-E', () => this.tryTrainHotkey('worker'));
+    kb.on('keydown-F', () => this.tryTrainHotkey('footman'));
+    kb.on('keydown-K', () => this.tryTrainHotkey('knight'));
+    kb.on('keydown-C', () => this.tryTrainHotkey('catapult'));
+    kb.on('keydown-F9', () => this.toggleTestMode());
+    kb.on('keydown-MINUS', () => this.cycleTestSpeed(-1));
+    kb.on('keydown-PLUS', () => this.cycleTestSpeed(1));
+    kb.on('keydown-NUMPAD_SUBTRACT', () => this.cycleTestSpeed(-1));
+    kb.on('keydown-NUMPAD_ADD', () => this.cycleTestSpeed(1));
+    if (this.debugPerf) {
+      kb.on('keydown-F6', () => this.restartDebugPerfScenario(100));
+      kb.on('keydown-F7', () => this.restartDebugPerfScenario(300));
+      kb.on('keydown-F8', () => this.restartDebugPerfScenario(500));
+    }
+
+    for (let i = 1; i <= 9; i++) {
+      kb.on(`keydown-${i}`, (ev: KeyboardEvent) => {
+        if (ev.ctrlKey || ev.metaKey) {
+          this.controlGroups[i] = this.selected.filter(u => u.alive);
+          this.effects.statusText(this.cameras.main.midPoint.x, this.cameras.main.midPoint.y - 80, `Группа ${i} сохранена`, 0xaaffaa);
+        } else this.selectGroup(i);
+      });
+    }
+
+    this.input.on('pointerdown', (p: Phaser.Input.Pointer) => {
+      if (this.isOverUi(p)) return;
+      if (this.isStoryControlLocked()) return;
+      if (p.middleButtonDown()) {
+        this.panStart = { x: p.x, y: p.y, sx: this.cameras.main.scrollX, sy: this.cameras.main.scrollY };
+        return;
+      }
+      if (p.leftButtonDown()) {
+        if (this.placementKind) { this.tryPlaceBuilding(p); return; }
+        if (this.castTumanetsMode) { this.castTumanets(p.worldX, p.worldY); this.setCastTumanetsMode(false); return; }
+        if (this.attackMoveMode) { this.commandAttackMoveWorld(p); this.setAttackMoveMode(false); return; }
+        this.dragStart = { x: p.worldX, y: p.worldY };
+      } else if (p.rightButtonDown()) {
+        if (this.placementKind) { this.cancelPlacement(); return; }
+        this.commandRightClickWorld(p);
+      }
+    });
+
+    this.input.on('pointerup', (p: Phaser.Input.Pointer) => {
+      if (this.panStart && !p.middleButtonDown()) this.panStart = null;
+      if (!p.leftButtonReleased()) return;
+      if (!this.dragStart) return;
+      const end = { x: p.worldX, y: p.worldY };
+      const dist = Phaser.Math.Distance.Between(this.dragStart.x, this.dragStart.y, end.x, end.y);
+      const additive = (p.event as MouseEvent | undefined)?.shiftKey ?? false;
+      if (dist < 6) this.clickSelect(end, additive);
+      else this.boxSelect(this.dragStart, end, additive);
+      this.dragStart = null;
+      this.selectionRect.clear();
+    });
+
+    this.input.on('pointermove', (p: Phaser.Input.Pointer) => {
+      if (this.panStart) {
+        const zoom = this.cameras.main.zoom || 1;
+        this.cameras.main.scrollX = this.panStart.sx + (this.panStart.x - p.x) / zoom;
+        this.cameras.main.scrollY = this.panStart.sy + (this.panStart.y - p.y) / zoom;
+      }
+      if (this.placementKind && this.placementGhost) this.updatePlacementGhost(p.worldX, p.worldY);
+      if (this.dragStart && p.leftButtonDown()) this.drawSelectionDrag(p);
+      this.updateCursor(p);
+      this.updateEntityHover(p);
+    });
+
+    this.input.mouse?.disableContextMenu();
+  }
+
+  private updateCursor(p: Phaser.Input.Pointer): void {
+    const screen = this.pointerClientPosition(p);
+    const overUi = this.isClientOverUi(screen.x, screen.y);
+    this.updateDomCursorFromClient(screen.x, screen.y);
+    if (overUi) return;
+
+    // Throttle expensive hit-test to ~90ms
+    const now = this.time.now;
+    if (now - this.lastCursorCheckMs < 90) return;
+    this.lastCursorCheckMs = now;
+
+    let key = 'cursor_default';
+    if (this.placementKind) {
+      const { tx, ty } = this.tileFromWorld(p.worldX, p.worldY);
+      key = this.canPlace(tx, ty, this.placementKind) ? 'cursor_build_ok' : 'cursor_build_no';
+    } else if (this.attackMoveMode) {
+      key = 'cursor_attack';
+    } else if (!this.isOverUi(p)) {
+      const hit = this.findEntityAt(p.worldX, p.worldY);
+      if (hit) {
+        if ((hit instanceof Unit || hit instanceof Building) && hit.side !== SIDE.player && hit.side !== SIDE.neutral) {
+          key = 'cursor_attack';
+        } else if (hit instanceof Caravan && this.selected.some(u => u.canAttack())) {
+          key = 'cursor_attack';
+        } else if (hit instanceof ResourceNode && this.selected.some(u => u.isWorker())) {
+          key = 'cursor_gather';
+        }
+      }
+    }
+
+    this.setDomCursorKey(key);
+  }
+
+  private isOverUi(p: Phaser.Input.Pointer): boolean {
+    const { x, y } = this.pointerClientPosition(p);
+    return this.isClientOverUi(x, y);
+  }
+
+  private isClientOverUi(x: number, y: number): boolean {
+    const el = document.elementFromPoint(x, y);
+    return !!el?.closest('#top-bar, #bottom-panel, #story-objectives.visible, #story-dialogue.visible, #minimap-border, #game-over-screen.visible, #menu-layer.visible, #pause-screen.visible, #menu-debug-panel.visible');
+  }
+
+  private pointerClientPosition(p: Phaser.Input.Pointer): { x: number; y: number } {
+    const ev = p.event as MouseEvent | undefined;
+    if (ev && typeof ev.clientX === 'number' && typeof ev.clientY === 'number') {
+      return { x: ev.clientX, y: ev.clientY };
+    }
+    const rect = this.game.canvas.getBoundingClientRect();
+    return {
+      x: rect.left + (p.x / VIEW_W) * rect.width,
+      y: rect.top + (p.y / VIEW_H) * rect.height
+    };
+  }
+
+  private setupDomCursor(): void {
+    this.cursorEl = document.getElementById('game-cursor') as HTMLImageElement | null;
+    if (!this.cursorEl) {
+      this.cursorEl = document.createElement('img');
+      this.cursorEl.id = 'game-cursor';
+      this.cursorEl.alt = '';
+      this.cursorEl.draggable = false;
+      document.body.appendChild(this.cursorEl);
+    }
+    this.lastCursorKey = 'cursor_default';
+    this.cursorEl.src = this.cursorUrl(this.lastCursorKey);
+    this.cursorEl.classList.add('hidden');
+    document.body.classList.add('game-cursor-active');
+    window.addEventListener('pointermove', this.onWindowPointerMove, { passive: true });
+    window.addEventListener('blur', this.onWindowBlur);
+  }
+
+  private teardownDomCursor(): void {
+    window.removeEventListener('pointermove', this.onWindowPointerMove);
+    window.removeEventListener('blur', this.onWindowBlur);
+    document.body.classList.remove('game-cursor-active');
+    this.cursorEl?.remove();
+    this.cursorEl = null;
+  }
+
+  private updateDomCursorFromClient(x: number, y: number): void {
+    this.lastCursorClient = { x, y };
+    this.setDomCursorVisible(true);
+    if (this.isClientOverUi(x, y)) this.setDomCursorKey('cursor_default');
+    this.positionDomCursor();
+  }
+
+  private setDomCursorKey(key: string): void {
+    if (!this.cursorEl || key === this.lastCursorKey) return;
+    this.lastCursorKey = key;
+    this.cursorEl.src = this.cursorUrl(key);
+    this.positionDomCursor();
+  }
+
+  private setDomCursorVisible(visible: boolean): void {
+    this.cursorEl?.classList.toggle('hidden', !visible);
+  }
+
+  private positionDomCursor(): void {
+    if (!this.cursorEl) return;
+    const hot = CURSOR_HOTSPOTS[this.lastCursorKey] ?? CURSOR_HOTSPOTS.cursor_default;
+    const x = Math.round(this.lastCursorClient.x - hot.x);
+    const y = Math.round(this.lastCursorClient.y - hot.y);
+    this.cursorEl.style.transform = `translate3d(${x}px, ${y}px, 0)`;
+  }
+
+  private cursorUrl(key: string): string {
+    return artAssetUrl(`assets/art/ui/${key}.png`);
+  }
+
+  private updateEntityHover(p: Phaser.Input.Pointer): void {
+    const now = this.time.now;
+    if (this.isOverUi(p) || this.dragStart || this.placementKind) {
+      this.lastHoverCheckMs = now;
+      this.emitEntityHover(null, p);
+      return;
+    }
+    if (now - this.lastHoverCheckMs < 80) return;
+    this.lastHoverCheckMs = now;
+
+    this.emitEntityHover(this.findEntityAt(p.worldX, p.worldY), p);
+  }
+
+  private emitEntityHover(entity: IEntity | null, p?: Phaser.Input.Pointer): void {
+    const next = entity?.alive ? entity : null;
+    if (!next && !this.hoveredEntity) return;
+    this.hoveredEntity = next;
+    const pointer = p ?? this.input.activePointer;
+    const screen = this.pointerClientPosition(pointer);
+    this.game.events.emit('ui-entity-hover', {
+      entity: this.hoveredEntity,
+      screenX: screen.x,
+      screenY: screen.y
+    });
+  }
+
+  private tileFromWorld(x: number, y: number): { tx: number; ty: number } {
+    return { tx: Math.floor(x / TILE), ty: Math.floor(y / TILE) };
+  }
+
+  private clickSelect(pos: { x: number; y: number }, additive: boolean): void {
+    const hit = this.findEntityAt(pos.x, pos.y);
+    if (!hit) {
+      if (!additive) this.clearSelection();
+      return;
+    }
+
+    if (hit instanceof Unit && hit.side === SIDE.player) {
+      const now = this.time.now;
+      if (this.lastClick && this.lastClick.kind === hit.unitKind && now - this.lastClick.time < 360) {
+        this.selectSameTypeOnScreen(hit.unitKind, additive);
+      } else {
+        if (!additive) { this.selected = []; this.selectedBuilding = null; }
+        this.toggleUnitSelection(hit, additive);
+      }
+      this.lastClick = { kind: hit.unitKind, time: now };
+      this.updateSelectionRings();
+      this.audio.play('select');
+      return;
+    }
+
+    if (hit instanceof Building && hit.side === SIDE.player) {
+      if (!additive) this.clearSelection(false);
+      this.selected = [];
+      this.selectedBuilding = hit;
+      this.updateSelectionRings();
+      this.audio.play('select');
+    } else if (!additive) {
+      this.clearSelection();
+    }
+  }
+
+  private boxSelect(a: { x: number; y: number }, b: { x: number; y: number }, additive: boolean): void {
+    if (!additive) this.clearSelection(false);
+    const x1 = Math.min(a.x, b.x), x2 = Math.max(a.x, b.x);
+    const y1 = Math.min(a.y, b.y), y2 = Math.max(a.y, b.y);
+    const picked = this.units.filter(u => u.alive && u.side === SIDE.player && u.x >= x1 && u.x <= x2 && u.y >= y1 && u.y <= y2);
+    for (const u of picked) if (!this.selected.includes(u)) this.selected.push(u);
+    this.selectedBuilding = null;
+    if (this.selected.length === 0) {
+      const building = this.buildings.find((bld) => {
+        const radius = bld.visualRadius ?? bld.radius;
+        return bld.alive
+          && bld.side === SIDE.player
+          && Math.abs(bld.x - (x1 + x2) / 2) < radius
+          && Math.abs(bld.y - (y1 + y2) / 2) < radius;
+      });
+      if (building) this.selectedBuilding = building;
+    }
+    this.updateSelectionRings();
+    if (this.selected.length || this.selectedBuilding) this.audio.play('select');
+  }
+
+  private selectSameTypeOnScreen(kind: UnitKind, additive: boolean): void {
+    const cam = this.cameras.main;
+    if (!additive) this.selected = [];
+    this.selectedBuilding = null;
+    for (const u of this.units) {
+      if (!u.alive || u.side !== SIDE.player || u.unitKind !== kind) continue;
+      if (!Phaser.Geom.Rectangle.Contains(cam.worldView, u.x, u.y)) continue;
+      if (!this.selected.includes(u)) this.selected.push(u);
+    }
+  }
+
+  private toggleUnitSelection(u: Unit, additive: boolean): void {
+    if (!additive) {
+      this.selected = [u];
+      this.selectedBuilding = null;
+      return;
+    }
+    const idx = this.selected.indexOf(u);
+    if (idx >= 0) this.selected.splice(idx, 1);
+    else this.selected.push(u);
+    this.selectedBuilding = null;
+  }
+
+  private drawSelectionDrag(p: Phaser.Input.Pointer): void {
+    this.selectionRect.clear();
+    this.selectionRect.lineStyle(1.5, 0x66ff66, 1);
+    const cam = this.cameras.main;
+    const sx = this.dragStart!.x - cam.scrollX;
+    const sy = this.dragStart!.y - cam.scrollY;
+    const ex = p.worldX - cam.scrollX;
+    const ey = p.worldY - cam.scrollY;
+    this.selectionRect.strokeRect(Math.min(sx, ex), Math.min(sy, ey), Math.abs(ex - sx), Math.abs(ey - sy));
+  }
+
+  private findEntityAt(x: number, y: number): IEntity | null {
+    for (const u of this.units) {
+      if (u.alive && u.sprite.visible && Phaser.Math.Distance.Between(x, y, u.x, u.y) <= u.radius + 5) return u;
+    }
+    for (const a of this.animals) {
+      if (a.alive && a.sprite.visible && Phaser.Math.Distance.Between(x, y, a.x, a.y) <= a.radius + 6) return a;
+    }
+    for (const c of this.caravans) {
+      if (c.alive && c.sprite.visible && Phaser.Math.Distance.Between(x, y, c.x, c.y) <= c.radius + 6) return c;
+    }
+    for (const b of this.buildings) {
+      const radius = b.visualRadius ?? b.radius;
+      if (b.alive && b.sprite.visible && Math.abs(x - b.x) <= radius && Math.abs(y - b.y) <= radius) return b;
+    }
+    for (const r of this.resources) {
+      const radius = r.visualRadius ?? r.radius;
+      if (r.alive && r.sprite.visible && Math.abs(x - r.x) <= radius && Math.abs(y - r.y) <= radius) return r;
+    }
+    return null;
+  }
+
+  clearSelection(emit = true): void {
+    this.selected = [];
+    this.selectedBuilding = null;
+    this.updateSelectionRings(emit);
+  }
+
+  selectGroup(i: number): void {
+    const g = this.controlGroups[i];
+    if (!g) return;
+    this.selected = g.filter(u => u.alive);
+    this.selectedBuilding = null;
+    this.updateSelectionRings();
+    this.audio.play('select');
+  }
+
+  private updateSelectionRings(emit = true): void {
+    for (const r of this.selectionRings) r.destroy();
+    this.selectionRings = [];
+    if (this.buildingSelectionRing) { this.buildingSelectionRing.destroy(); this.buildingSelectionRing = null; }
+    for (const u of this.selected) {
+      const ringKey = u.unitKind === 'catapult' ? 'ring_select_l'
+        : u.unitKind === 'knight' ? 'ring_select_m'
+        : 'ring_select_s';
+      const r = this.add.sprite(u.x, u.y, ringKey).setDepth(29);
+      r.setData('follow', u);
+      r.setTint(RACE_COLOR[u.race]);
+      this.tweens.add({
+        targets: r,
+        scale: { from: 0.9, to: 1.1 },
+        alpha: { from: 0.7, to: 1 },
+        duration: 720,
+        yoyo: true,
+        repeat: -1,
+        ease: 'Sine.easeInOut'
+      });
+      this.tweens.add({
+        targets: r,
+        rotation: Math.PI * 2,
+        duration: 7000,
+        repeat: -1
+      });
+      this.selectionRings.push(r);
+    }
+    if (this.selectedBuilding) {
+      const b = this.selectedBuilding;
+      const ring = this.add.sprite(b.x, b.y, 'ring48').setDepth(29);
+      const radius = b.visualRadius ?? b.radius;
+      ring.setDisplaySize(radius * 2 + 10, radius * 2 + 10);
+      this.tweens.add({
+        targets: ring,
+        alpha: { from: 0.7, to: 1 },
+        duration: 500,
+        yoyo: true,
+        repeat: -1,
+        ease: 'Sine.easeInOut'
+      });
+      this.buildingSelectionRing = ring;
+    }
+    this.drawRally();
+    if (emit) this.game.events.emit('selection-changed', { units: this.selected, building: this.selectedBuilding });
+  }
+
+  private commandRightClickWorld(p: Phaser.Input.Pointer): void {
+    if (this.selectedBuilding) {
+      if (this.selectedBuilding.completed) {
+        this.selectedBuilding.rally = { x: p.worldX, y: p.worldY };
+        this.effects.commandMarker(p.worldX, p.worldY, 0xffffff, 'rally', 'Сбор');
+        this.audio.play('move');
+        this.drawRally();
+      }
+      return;
+    }
+    if (this.selected.length === 0) return;
+    this.disableSelectedAutopilot();
+    const hit = this.findEntityAt(p.worldX, p.worldY);
+    if (hit instanceof Animal) {
+      const hunters = this.selected.filter(u => u.canAttack());
+      for (const u of hunters) this.orderAttack(u, hit);
+      if (hunters.length) {
+        const hostile = ANIMAL[hit.animalKind].predator || hit.animalKind === 'wolf_den';
+        this.effects.targetMarker(hit, hostile ? 0xff4444 : 0xffc24a, hostile ? 'Атака' : 'Полювання');
+        this.audio.play(hostile ? 'attack' : 'move');
+      } else this.commandMoveTo(p.worldX, p.worldY);
+    } else if (hit instanceof Caravan) {
+      for (const u of this.selected) this.orderAttack(u, hit);
+      this.effects.targetMarker(hit, 0xffaa44, 'Валка');
+      this.audio.play('attack');
+    } else if (hit instanceof Unit && hit.side !== SIDE.player && hit.side !== SIDE.neutral) {
+      for (const u of this.selected) this.orderAttack(u, hit);
+      this.effects.targetMarker(hit, 0xff4444, 'Атака');
+      this.audio.play('attack');
+    } else if (hit instanceof Building && hit.side !== SIDE.player) {
+      for (const u of this.selected) this.orderAttackBuilding(u, hit);
+      this.effects.targetMarker(hit, 0xff4444, 'Атака');
+      this.audio.play('attack');
+    } else if (hit instanceof ResourceNode) {
+      const workers = this.selected.filter(u => u.isWorker());
+      if (workers.length) {
+        this.orderGatherGroup(workers, hit);
+        this.effects.targetMarker(hit, 0xffd84a, RES_MARKER[hit.resourceType]);
+        this.audio.play('move');
+      } else this.commandMoveTo(p.worldX, p.worldY);
+    } else if (hit instanceof Building && hit.side === SIDE.player && !hit.completed) {
+      const workers = this.selected.filter(u => u.isWorker());
+      if (workers.length) {
+        for (const u of workers) this.orderBuild(u, hit);
+        this.effects.targetMarker(hit, 0x88ff88, 'Строить');
+        this.audio.play('move');
+      } else {
+        this.commandMoveTo(p.worldX, p.worldY);
+      }
+    } else if (hit instanceof Building && hit.side === SIDE.player && hit.completed && hit.buildingKind === 'townhall') {
+      let returned = false;
+      for (const u of this.selected) if (u.isWorker() && u.cargo) { this.orderReturnCargo(u, hit); returned = true; }
+      if (returned) {
+        this.effects.targetMarker(hit, 0x66ddff, 'Сдать');
+        this.audio.play('move');
+      } else this.commandMoveTo(p.worldX, p.worldY);
+    } else {
+      this.commandMoveTo(p.worldX, p.worldY);
+    }
+  }
+
+  private commandMoveTo(x: number, y: number): void {
+    this.orderMoveGroup(this.selected, x, y);
+    this.effects.commandMarker(x, y, 0x66ff66, 'move', 'Идти');
+    this.audio.play('move');
+  }
+
+  private commandAttackMoveWorld(p: Phaser.Input.Pointer): void {
+    this.disableSelectedAutopilot();
+    this.orderAttackMoveGroup(this.selected, p.worldX, p.worldY);
+    this.effects.commandMarker(p.worldX, p.worldY, 0xff9944, 'attack', 'Атака');
+    this.audio.play('attack');
+  }
+
+  private commandStop(): void {
+    this.disableSelectedAutopilot();
+    for (const u of this.selected) u.clearOrders();
+    this.setAttackMoveMode(false);
+    this.audio.play('move', 0.5);
+  }
+
+  isAutopilotAllowed(): boolean {
+    return true;
+  }
+
+  getStoryBuildLock(kind: BuildingKind): string | null {
+    return this.storyController?.buildRestrictionReason(kind) ?? null;
+  }
+
+  getStoryTrainLock(kind: UnitKind): string | null {
+    return this.storyController?.trainRestrictionReason(kind) ?? null;
+  }
+
+  getStoryRestrictionSignature(): string {
+    return this.storyController?.getState().phase ?? '';
+  }
+
+  toggleAutopilotForSelection(): void {
+    if (!this.isAutopilotAllowed()) return;
+    const units = this.selected.filter(u => u.alive && u.side === SIDE.player);
+    if (units.length === 0) return;
+
+    const enable = units.some(u => !u.autopilot);
+    for (const u of units) {
+      u.autopilot = enable;
+      u.autopilotAnchor = enable ? { x: u.x, y: u.y } : null;
+      u.autopilotNextThinkMs = enable ? this.time.now : 0;
+    }
+
+    const mid = this.cameras.main.midPoint;
+    this.effects.statusText(mid.x, mid.y - 80, enable ? 'Автопилот включен' : 'Автопилот выключен', enable ? 0x66ddff : 0xffffff);
+    this.audio.play('move', 0.45);
+    this.game.events.emit('selection-changed', { units: this.selected, building: this.selectedBuilding });
+  }
+
+  private disableSelectedAutopilot(): void {
+    let changed = false;
+    for (const u of this.selected) {
+      if (!u.autopilot) continue;
+      u.autopilot = false;
+      u.autopilotAnchor = null;
+      u.autopilotNextThinkMs = 0;
+      changed = true;
+    }
+    if (changed) this.game.events.emit('selection-changed', { units: this.selected, building: this.selectedBuilding });
+  }
+
+  private centerOnTownhall(): void {
+    const th = this.buildings.find(b => b.alive && b.side === SIDE.player && b.buildingKind === 'townhall');
+    if (th) this.centerCameraOn(th.x, th.y);
+  }
+
+  private centerCameraOn(x: number, y: number): void {
+    const cam = this.cameras.main;
+    const zoom = cam.zoom || 1;
+    const viewW = cam.width / zoom;
+    const viewH = cam.height / zoom;
+    cam.setScroll(
+      Phaser.Math.Clamp(x - viewW / 2, 0, Math.max(0, WORLD_W - viewW)),
+      Phaser.Math.Clamp(y - viewH / 2, 0, Math.max(0, WORLD_H - viewH))
+    );
+  }
+
+  private restartGame(): void {
+    this.scene.stop('UIScene');
+    this.scene.restart({ ...this.launchConfig, seed: Math.floor(Math.random() * 100000) });
+  }
+
+  private setupPauseUi(): void {
+    this.pauseEl = document.getElementById('pause-screen');
+    if (!this.pauseEl || this.pauseHandlersBound) return;
+    const resume = document.getElementById('btn-pause-resume');
+    const restart = document.getElementById('btn-pause-restart');
+    const menu = document.getElementById('btn-pause-menu');
+    if (resume) resume.onclick = () => this.togglePause();
+    if (restart) restart.onclick = () => this.restartFromPause();
+    if (menu) menu.onclick = () => this.exitToMainMenu();
+    this.hidePauseOverlay();
+    this.pauseHandlersBound = true;
+  }
+
+  private teardownPauseUi(): void {
+    this.hidePauseOverlay();
+    if (this.paused) {
+      this.paused = false;
+      window.removeEventListener('keydown', this.onPauseWindowKeydown);
+    }
+    if (this.pauseHandlersBound) {
+      const resume = document.getElementById('btn-pause-resume');
+      const restart = document.getElementById('btn-pause-restart');
+      const menu = document.getElementById('btn-pause-menu');
+      if (resume) resume.onclick = null;
+      if (restart) restart.onclick = null;
+      if (menu) menu.onclick = null;
+      this.pauseHandlersBound = false;
+    }
+  }
+
+  private togglePause(): void {
+    if (this.gameOver) return;
+    if (this.paused) this.resumeGame();
+    else this.pauseGame();
+  }
+
+  private pauseGame(): void {
+    if (this.paused) return;
+    this.paused = true;
+    this.cancelPlacement();
+    this.setAttackMoveMode(false);
+    this.showPauseOverlay();
+    window.addEventListener('keydown', this.onPauseWindowKeydown);
+    this.scene.pause();
+  }
+
+  private resumeGame(): void {
+    if (!this.paused) return;
+    this.paused = false;
+    window.removeEventListener('keydown', this.onPauseWindowKeydown);
+    this.hidePauseOverlay();
+    if (!this.dialoguePaused) this.scene.resume();
+  }
+
+  private pauseForDialogue(): void {
+    if (this.dialoguePaused) return;
+    this.dialoguePaused = true;
+    if (this.pendingCameraFocus) {
+      const cam = this.cameras.main;
+      this.tweens.killTweensOf(cam);
+      cam.scrollX = this.pendingCameraFocus.x;
+      cam.scrollY = this.pendingCameraFocus.y;
+      this.pendingCameraFocus = null;
+    }
+    if (!this.paused) this.scene.pause();
+  }
+
+  private resumeFromDialogue(): void {
+    if (!this.dialoguePaused) return;
+    this.dialoguePaused = false;
+    if (!this.paused) this.scene.resume();
+  }
+
+  private showPauseOverlay(): void {
+    if (!this.pauseEl) return;
+    this.pauseEl.classList.add('visible');
+    this.pauseEl.setAttribute('aria-hidden', 'false');
+  }
+
+  private hidePauseOverlay(): void {
+    if (!this.pauseEl) return;
+    this.pauseEl.classList.remove('visible');
+    this.pauseEl.setAttribute('aria-hidden', 'true');
+  }
+
+  private onPauseWindowKeydown = (ev: KeyboardEvent): void => {
+    if (ev.key === 'Escape') {
+      ev.preventDefault();
+      this.resumeGame();
+    }
+  };
+
+  private restartFromPause(): void {
+    this.clearPauseState();
+    this.scene.resume();
+    this.restartGame();
+  }
+
+  private exitToMainMenu(): void {
+    this.clearPauseState();
+    this.scene.resume();
+    this.scene.stop('UIScene');
+    this.scene.stop('GameScene');
+    this.scene.start('MenuScene');
+  }
+
+  private clearPauseState(): void {
+    this.hidePauseOverlay();
+    if (this.paused) {
+      this.paused = false;
+      window.removeEventListener('keydown', this.onPauseWindowKeydown);
+    }
+  }
+
+  private restartDebugPerfScenario(size: PerfScenarioSize): void {
+    if (!this.debugPerf) return;
+    this.scene.stop('UIScene');
+    this.scene.restart({ ...this.launchConfig, seed: this.seed, debugPerfSize: size });
+  }
+
+  private setAttackMoveMode(v: boolean): void {
+    this.attackMoveMode = v;
+    this.game.events.emit('ui-mode', v ? 'Атака-движение: ЛКМ по земле или цели' : '');
+    if (v) this.effects.statusText(this.cameras.main.midPoint.x, this.cameras.main.midPoint.y - 100, 'Атака-движение', 0xffaa66);
+  }
+
+  orderMoveGroup(units: Unit[], x: number, y: number): void {
+    const group = units.filter(u => u.alive);
+    if (group.length === 0) return;
+    if (group.length === 1) {
+      this.orderMove(group[0], x, y);
+      return;
+    }
+
+    const slots = this.resolveFormationSlots(group, formationSlots(group, { x, y }, 32), { x, y });
+    const groupMoveId = this.nextGroupMoveId++;
+    const sharedPath = this.findSharedGroupPath(group, x, y);
+    group.forEach((u, i) => {
+      u.clearOrders();
+      u.state = 'move';
+      this.applyGroupPath(u, slots[i], sharedPath, groupMoveId);
+    });
+  }
+
+  orderAttackMoveGroup(units: Unit[], x: number, y: number): void {
+    const group = units.filter(u => u.alive);
+    if (group.length === 0) return;
+    if (group.length === 1) {
+      const u = group[0];
+      if (!u.canAttack()) {
+        this.orderMove(u, x, y);
+        return;
+      }
+      u.clearOrders();
+      u.state = 'attack_move';
+      u.attackMoveTo = { x, y };
+      this.repath(u, x, y, 'attack-move', { force: true });
+      return;
+    }
+
+    const slots = this.resolveFormationSlots(group, formationSlots(group, { x, y }, 34), { x, y });
+    const groupMoveId = this.nextGroupMoveId++;
+    const sharedPath = this.findSharedGroupPath(group, x, y);
+    group.forEach((u, i) => {
+      u.clearOrders();
+      if (!u.canAttack()) {
+        u.state = 'move';
+      } else {
+        u.state = 'attack_move';
+        u.attackMoveTo = slots[i];
+      }
+      this.applyGroupPath(u, slots[i], sharedPath, groupMoveId);
+    });
+  }
+
+  orderMove(u: Unit, x: number, y: number): void {
+    u.clearOrders();
+    u.state = 'move';
+    this.repath(u, x, y, 'command', { force: true });
+  }
+
+  orderAttack(u: Unit, target: IEntity): void {
+    if (!u.canAttack()) return;
+    u.clearOrders();
+    u.state = 'attack';
+    if (target instanceof Building) u.targetBuilding = target;
+    else u.targetUnit = target;
+  }
+
+  orderAttackBuilding(u: Unit, target: Building): void {
+    if (!u.canAttack()) return;
+    u.clearOrders();
+    u.state = 'attack';
+    u.targetBuilding = target;
+  }
+
+  orderGather(u: Unit, node: ResourceNode, approach?: Point | null): void {
+    u.clearOrders();
+    u.state = 'gather';
+    u.targetResource = node;
+    u.resourceApproach = approach ?? this.findResourceApproachSlot(u, node);
+    u.gatherAccum = 0;
+    const dest = u.resourceApproach ?? { x: node.x, y: node.y };
+    this.repath(u, dest.x, dest.y, 'resource', { force: true });
+  }
+
+  private orderGatherGroup(units: Unit[], node: ResourceNode): void {
+    const group = units.filter(u => u.alive && u.isWorker());
+    if (group.length === 0) return;
+
+    const ignored = new Set(group);
+    const reserved = this.resourceApproachReservations(node, ignored);
+    for (const u of group) {
+      const approach = this.findResourceApproachSlot(u, node, reserved, ignored);
+      if (approach) this.reserveFormationSlot(approach, reserved);
+      this.orderGather(u, node, approach);
+    }
+  }
+
+  private resourceApproachReservations(node: ResourceNode, ignored: Set<Unit>): Set<string> {
+    const reserved = new Set<string>();
+    for (const other of this.units) {
+      if (!other.alive || ignored.has(other) || other.targetResource !== node || !other.resourceApproach) continue;
+      const t = this.tileFromWorld(other.resourceApproach.x, other.resourceApproach.y);
+      if (this.map.isWalkable(t.tx, t.ty)) reserved.add(this.formationSlotKey(t.tx, t.ty));
+    }
+    return reserved;
+  }
+
+  private findResourceApproachSlot(
+    unit: Unit,
+    node: ResourceNode,
+    reserved?: Set<string>,
+    ignored?: Set<Unit>
+  ): Point | null {
+    const ignoredUnits = ignored ?? new Set<Unit>([unit]);
+    const reservedSlots = reserved ?? this.resourceApproachReservations(node, ignoredUnits);
+    const candidates = this.resourceApproachCandidates(unit, node)
+      .sort((a, b) => Phaser.Math.Distance.Between(unit.x, unit.y, a.x, a.y) - Phaser.Math.Distance.Between(unit.x, unit.y, b.x, b.y));
+
+    let fallback: Point | null = null;
+    for (const point of candidates) {
+      const t = this.tileFromWorld(point.x, point.y);
+      const key = this.formationSlotKey(t.tx, t.ty);
+      if (!reservedSlots.has(key) && !fallback) fallback = point;
+      if (this.isResourceApproachAvailable(unit, point, reservedSlots, ignoredUnits)) return point;
+    }
+    return fallback ?? candidates[0] ?? null;
+  }
+
+  private resourceApproachCandidates(unit: Unit, node: ResourceNode): Point[] {
+    const reach = this.gatherReach(unit);
+    const minTx = node.tx;
+    const minTy = node.ty;
+    const maxTx = node.tx + node.tileW - 1;
+    const maxTy = node.ty + node.tileH - 1;
+    const candidates: Point[] = [];
+    const seen = new Set<string>();
+
+    for (let r = 1; r <= 4; r++) {
+      for (let ty = minTy - r; ty <= maxTy + r; ty++) {
+        for (let tx = minTx - r; tx <= maxTx + r; tx++) {
+          if (tx > minTx - r && tx < maxTx + r && ty > minTy - r && ty < maxTy + r) continue;
+          if (!this.map.isWalkable(tx, ty)) continue;
+          const key = this.formationSlotKey(tx, ty);
+          if (seen.has(key)) continue;
+          const point = this.map.tileToWorld(tx, ty);
+          if (this.distanceToResourceFootprint(point.x, point.y, node) > reach) continue;
+          seen.add(key);
+          candidates.push(point);
+        }
+      }
+    }
+
+    return candidates;
+  }
+
+  private isResourceApproachAvailable(
+    unit: Unit,
+    point: Point,
+    reserved: Set<string>,
+    ignored: Set<Unit>
+  ): boolean {
+    const t = this.tileFromWorld(point.x, point.y);
+    if (!this.map.isWalkable(t.tx, t.ty)) return false;
+    if (reserved.has(this.formationSlotKey(t.tx, t.ty))) return false;
+    for (const other of this.queryUnitsInRadius(point.x, point.y, unit.radius + 48)) {
+      if (!other.alive || ignored.has(other)) continue;
+      const min = unit.radius + other.radius + 4;
+      if (Phaser.Math.Distance.Between(point.x, point.y, other.x, other.y) < min) return false;
+    }
+    return true;
+  }
+
+  private ensureResourceApproach(u: Unit, node: ResourceNode): Point | null {
+    if (u.resourceApproach && this.isResourceApproachStillValid(u, node, u.resourceApproach)) return u.resourceApproach;
+    u.resourceApproach = this.findResourceApproachSlot(u, node);
+    return u.resourceApproach;
+  }
+
+  private isResourceApproachStillValid(u: Unit, node: ResourceNode, point: Point): boolean {
+    const t = this.tileFromWorld(point.x, point.y);
+    return this.map.isWalkable(t.tx, t.ty)
+      && this.distanceToResourceFootprint(point.x, point.y, node) <= this.gatherReach(u);
+  }
+
+  private gatherReach(u: Unit): number {
+    return u.radius + TILE * 1.5;
+  }
+
+  private canGatherResource(u: Unit, distToFootprint: number): boolean {
+    if (distToFootprint <= this.gatherReach(u)) return true;
+    if (distToFootprint > u.radius + RESOURCE_GATHER_SOFT_REACH) return false;
+    return u.pathWaitMs >= RESOURCE_GATHER_WAIT_MS || u.pathStuckMs >= STUCK_REPATH_MS * 0.65;
+  }
+
+  private distanceToResourceFootprint(x: number, y: number, node: ResourceNode): number {
+    const left = node.tx * TILE;
+    const top = node.ty * TILE;
+    const right = (node.tx + node.tileW) * TILE;
+    const bottom = (node.ty + node.tileH) * TILE;
+    const closestX = Phaser.Math.Clamp(x, left, right);
+    const closestY = Phaser.Math.Clamp(y, top, bottom);
+    return Phaser.Math.Distance.Between(x, y, closestX, closestY);
+  }
+
+  private shouldRepathTo(u: Unit, dest: Point, maxAgeMs = 500): boolean {
+    return u.path.length === 0
+      || u.pathRepathMs > maxAgeMs
+      || !u.pathDest
+      || Phaser.Math.Distance.Between(u.pathDest.x, u.pathDest.y, dest.x, dest.y) > TILE * 0.5;
+  }
+
+  orderReturnCargo(u: Unit, hall: Building): void {
+    u.groupMoveId = 0;
+    u.groupSlot = null;
+    u.pathWaitMs = 0;
+    u.returnTo = hall;
+    u.state = 'return_cargo';
+    this.repath(u, hall.x, hall.y, 'return', { force: true });
+  }
+
+  orderBuild(u: Unit, site: Building): void {
+    u.clearOrders();
+    u.state = 'build';
+    u.targetBuilding = site;
+    this.repath(u, site.x, site.y, 'build', { force: true });
+  }
+
+  repath(u: Unit, wx: number, wy: number, reason: RepathReason = 'command', options: { force?: boolean; cooldownMs?: number } = {}): boolean {
+    const now = this.time.now;
+    if (!options.force) {
+      if (this.repathsThisFrame >= MAX_REPATHS_PER_FRAME) return false;
+      if (now < u.nextRepathAtMs) return false;
+    }
+    this.repathsThisFrame++;
+    const s = this.tileFromWorld(u.x, u.y);
+    const g = this.tileFromWorld(wx, wy);
+    const path = findPath(this.map, s.tx, s.ty, g.tx, g.ty);
+    const wp = path.map(p => ({ x: p.tx * TILE + TILE / 2, y: p.ty * TILE + TILE / 2 }));
+    u.setPath(wp);
+    u.pathDest = wp.length > 0 ? wp[wp.length - 1] : { x: wx, y: wy };
+    u.pathRepathMs = 0;
+    u.lastRepathReason = reason;
+    const baseCooldown = options.cooldownMs ?? (u.groupMoveId ? GROUP_REPATH_COOLDOWN_MS : SINGLE_REPATH_COOLDOWN_MS);
+    u.nextRepathAtMs = now + baseCooldown + this.repathJitter(u);
+    return wp.length > 0;
+  }
+
+  private findSharedGroupPath(units: Unit[], x: number, y: number): SharedGroupPath | null {
+    const center = this.groupCentroid(units);
+    const s = this.tileFromWorld(center.x, center.y);
+    const g = this.tileFromWorld(x, y);
+    if (!this.map.isWalkable(s.tx, s.ty)) return null;
+    const path = findPath(this.map, s.tx, s.ty, g.tx, g.ty);
+    if (path.length === 0) return null;
+    return {
+      points: path.map(p => ({ x: p.tx * TILE + TILE / 2, y: p.ty * TILE + TILE / 2 })),
+      tailCache: new Map()
+    };
+  }
+
+  private applyGroupPath(u: Unit, destination: Point, sharedPath: SharedGroupPath | null, groupMoveId: number): void {
+    u.groupMoveId = groupMoveId;
+    u.groupSlot = destination;
+
+    if (!sharedPath || sharedPath.points.length === 0) {
+      this.repath(u, destination.x, destination.y, 'group-fallback', { force: true, cooldownMs: GROUP_REPATH_COOLDOWN_MS });
+      return;
+    }
+
+    let path = this.applyGroupLaneOffset(sharedPath.points, destination);
+    path = this.trimGroupPathForUnit(u, path);
+    const tail = this.findGroupSlotTail(sharedPath, path[path.length - 1], destination);
+    if (tail) {
+      path.pop();
+      path.push(...tail);
+    } else if (this.hasClearWalkableLine(path[path.length - 1], destination)) {
+      // Only snap to the literal destination when it's directly reachable on a walkable tile —
+      // otherwise leave the pathfinder's walkable endpoint as the final waypoint so the unit
+      // can actually arrive (e.g. destination sits inside an unwalkable resource/building footprint).
+      path[path.length - 1] = { x: destination.x, y: destination.y };
+    }
+    u.setPath(path);
+    u.pathRepathMs = 0;
+    u.lastRepathReason = 'group';
+    u.nextRepathAtMs = this.time.now + GROUP_REPATH_COOLDOWN_MS + this.repathJitter(u);
+  }
+
+  private trimGroupPathForUnit(u: Unit, path: Point[]): Point[] {
+    if (path.length <= 1) return path;
+    const maxLookahead = Math.min(path.length - 1, 10);
+    let bestIdx = 0;
+    let bestScore = Infinity;
+    for (let i = 0; i <= maxLookahead; i++) {
+      const p = path[i];
+      if (!this.hasClearWalkableLine({ x: u.x, y: u.y }, p)) continue;
+      const d = Phaser.Math.Distance.Between(u.x, u.y, p.x, p.y);
+      const score = d - i * TILE * 0.35;
+      if (score < bestScore) {
+        bestScore = score;
+        bestIdx = i;
+      }
+    }
+    if (bestIdx === 0) return path;
+    return path.slice(bestIdx);
+  }
+
+  private applyGroupLaneOffset(points: Point[], destination: Point): Point[] {
+    if (points.length < 2) return points.map(p => ({ x: p.x, y: p.y }));
+    const first = points[0];
+    const last = points[points.length - 1];
+    const dx = last.x - first.x;
+    const dy = last.y - first.y;
+    const len = Math.hypot(dx, dy);
+    if (len <= 0.01) return points.map(p => ({ x: p.x, y: p.y }));
+
+    const px = -dy / len;
+    const py = dx / len;
+    const desiredOffset = (destination.x - last.x) * px + (destination.y - last.y) * py;
+    const laneOffset = Phaser.Math.Clamp(desiredOffset, -GROUP_LANE_OFFSET_MAX, GROUP_LANE_OFFSET_MAX);
+    if (Math.abs(laneOffset) < 2) return points.map(p => ({ x: p.x, y: p.y }));
+
+    const out: Point[] = [];
+    let prev: Point | null = null;
+    for (const point of points) {
+      const candidate = { x: point.x + px * laneOffset, y: point.y + py * laneOffset };
+      const tile = this.tileFromWorld(candidate.x, candidate.y);
+      const ok: boolean = this.map.isWalkable(tile.tx, tile.ty) && (!prev || this.hasClearWalkableLine(prev, candidate));
+      const nextPoint: Point = ok ? candidate : { x: point.x, y: point.y };
+      out.push(nextPoint);
+      prev = nextPoint;
+    }
+    return out;
+  }
+
+  private findGroupSlotTail(sharedPath: SharedGroupPath, from: Point, destination: Point): Point[] | null {
+    if (this.hasClearWalkableLine(from, destination)) return null;
+    const s = this.tileFromWorld(from.x, from.y);
+    const g = this.tileFromWorld(destination.x, destination.y);
+    const key = `${s.tx}:${s.ty}>${g.tx}:${g.ty}`;
+    if (sharedPath.tailCache.has(key)) return sharedPath.tailCache.get(key) ?? null;
+    const tail = findPath(this.map, s.tx, s.ty, g.tx, g.ty);
+    if (tail.length === 0) {
+      sharedPath.tailCache.set(key, null);
+      return null;
+    }
+    const points = tail.map(p => ({ x: p.tx * TILE + TILE / 2, y: p.ty * TILE + TILE / 2 }));
+    // Only snap the final waypoint to the literal destination if its tile is walkable —
+    // otherwise (e.g. destination sits inside a building/resource footprint) keep the
+    // pathfinder's nearest-walkable endpoint so the unit can actually arrive there.
+    if (this.map.isWalkable(g.tx, g.ty)) points[points.length - 1] = { x: destination.x, y: destination.y };
+    sharedPath.tailCache.set(key, points);
+    return points;
+  }
+
+  private hasClearWalkableLine(a: Point, b: Point): boolean {
+    const dist = Phaser.Math.Distance.Between(a.x, a.y, b.x, b.y);
+    const steps = Math.max(1, Math.ceil(dist / (TILE / 2)));
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      const x = Phaser.Math.Linear(a.x, b.x, t);
+      const y = Phaser.Math.Linear(a.y, b.y, t);
+      const tile = this.tileFromWorld(x, y);
+      if (!this.map.isWalkable(tile.tx, tile.ty)) return false;
+    }
+    return true;
+  }
+
+  private repathJitter(u: Unit): number {
+    return (u.id % 17) * 13;
+  }
+
+  private resolveFormationSlots(
+    units: Unit[],
+    desiredSlots: { x: number; y: number }[],
+    fallback: { x: number; y: number }
+  ): { x: number; y: number }[] {
+    const reserved = new Set<string>();
+    const ignored = new Set(units);
+    return desiredSlots.map((slot, i) => this.resolveFormationSlot(units[i], slot, fallback, reserved, ignored));
+  }
+
+  private resolveFormationSlot(
+    unit: Unit,
+    desired: { x: number; y: number },
+    fallback: { x: number; y: number },
+    reserved: Set<string>,
+    ignored: Set<Unit>
+  ): { x: number; y: number } {
+    if (this.isFormationSlotAvailable(unit, desired, reserved, ignored)) {
+      this.reserveFormationSlot(desired, reserved);
+      return desired;
+    }
+
+    const origin = this.tileFromWorld(desired.x, desired.y);
+    for (let r = 1; r <= 6; r++) {
+      let best: { point: { x: number; y: number }; d: number } | null = null;
+      for (let dy = -r; dy <= r; dy++) {
+        for (let dx = -r; dx <= r; dx++) {
+          if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue;
+          const point = this.map.tileToWorld(origin.tx + dx, origin.ty + dy);
+          if (!this.isFormationSlotAvailable(unit, point, reserved, ignored)) continue;
+          const d = Phaser.Math.Distance.Between(desired.x, desired.y, point.x, point.y);
+          if (!best || d < best.d) best = { point, d };
+        }
+      }
+      if (best) {
+        this.reserveFormationSlot(best.point, reserved);
+        return best.point;
+      }
+    }
+
+    if (this.isFormationSlotAvailable(unit, fallback, reserved, ignored)) {
+      this.reserveFormationSlot(fallback, reserved);
+      return fallback;
+    }
+    return fallback;
+  }
+
+  private isFormationSlotAvailable(
+    unit: Unit,
+    point: { x: number; y: number },
+    reserved: Set<string>,
+    ignored: Set<Unit>
+  ): boolean {
+    if (point.x < 0 || point.y < 0 || point.x >= WORLD_W || point.y >= WORLD_H) return false;
+    const t = this.tileFromWorld(point.x, point.y);
+    if (!this.map.isWalkable(t.tx, t.ty)) return false;
+    if (reserved.has(this.formationSlotKey(t.tx, t.ty))) return false;
+
+    for (const other of this.queryUnitsInRadius(point.x, point.y, unit.radius + 48)) {
+      if (!other.alive || ignored.has(other)) continue;
+      const min = unit.radius + other.radius + 4;
+      if (Phaser.Math.Distance.Between(point.x, point.y, other.x, other.y) < min) return false;
+    }
+    return true;
+  }
+
+  private reserveFormationSlot(point: { x: number; y: number }, reserved: Set<string>): void {
+    const t = this.tileFromWorld(point.x, point.y);
+    reserved.add(this.formationSlotKey(t.tx, t.ty));
+  }
+
+  private formationSlotKey(tx: number, ty: number): string {
+    return `${tx}:${ty}`;
+  }
+
+  private groupCentroid(units: Unit[]): { x: number; y: number } {
+    let x = 0, y = 0;
+    for (const u of units) {
+      x += u.x;
+      y += u.y;
+    }
+    return { x: x / units.length, y: y / units.length };
+  }
+
+  beginPlacement(kind: BuildingKind): void {
+    const storyLock = this.getStoryBuildLock(kind);
+    if (storyLock) {
+      this.flashMessage(storyLock);
+      this.audio.play('error');
+      return;
+    }
+    if (!this.economy.canAfford(SIDE.player, BUILDING[kind].cost)) {
+      this.flashMessage(this.describeMissing(SIDE.player, BUILDING[kind].cost));
+      this.audio.play('error');
+      return;
+    }
+    const hasWorker = this.selected.some(u => u.isWorker());
+    if (!hasWorker) { this.flashMessage('Нужен рабочий'); this.audio.play('error'); return; }
+    this.cancelPlacement();
+    this.placementKind = kind;
+    if (buildingArtReady(this, kind, this.playerRace)) {
+      const display = BUILDING_ART_DISPLAY[kind];
+      this.placementGhost = this.add.sprite(0, 0, buildingSheetKey(kind, this.playerRace), getBuildingStageFrame('final'))
+        .setDisplaySize(display.width, display.height)
+        .setAlpha(0.72)
+        .setDepth(500);
+    } else {
+      this.placementGhost = this.add.sprite(0, 0, `building_${kind}_${this.playerRace}`).setAlpha(0.72).setDepth(500);
+    }
+    this.game.events.emit('ui-mode', `Строительство: ${BUILDING[kind].labelByRace[this.playerRace]}`);
+  }
+
+  cancelPlacement(): void {
+    if (this.placementGhost) this.placementGhost.destroy();
+    this.placementGhost = null;
+    this.placementKind = null;
+    this.footprint?.clear();
+    this.game.events.emit('ui-mode', this.attackMoveMode ? 'Атака-движение: ЛКМ по земле или цели' : '');
+  }
+
+  canPlace(tx: number, ty: number, kind: BuildingKind): boolean {
+    const size = BUILDING[kind].size;
+    for (let dy = 0; dy < size; dy++) {
+      for (let dx = 0; dx < size; dx++) {
+        if (!this.map.inBounds(tx + dx, ty + dy)) return false;
+        if (!this.map.isWalkable(tx + dx, ty + dy)) return false;
+      }
+    }
+    if (kind === 'townhall') {
+      const site = this.storyController?.townhallSite();
+      if (site && (tx !== site.tx || ty !== site.ty)) return false;
+    }
+    return true;
+  }
+
+  tryPlaceBuilding(p: Phaser.Input.Pointer): void {
+    if (!this.placementKind) return;
+    const { tx, ty } = this.tileFromWorld(p.worldX, p.worldY);
+    if (!this.canPlace(tx, ty, this.placementKind)) {
+      const onSiteOnly = this.placementKind === 'townhall' && this.storyController?.townhallSite();
+      this.flashMessage(onSiteOnly ? 'Хутір можна ставити лише на городищі' : 'Нельзя построить здесь');
+      this.audio.play('error');
+      return;
+    }
+    const def = BUILDING[this.placementKind];
+    if (!this.economy.spend(SIDE.player, def.cost)) return;
+    const site = this.spawnBuilding(tx, ty, this.placementKind, SIDE.player, this.playerRace, false);
+    const worker = this.selected.find(u => u.isWorker())!;
+    this.disableSelectedAutopilot();
+    this.orderBuild(worker, site);
+    this.effects.commandMarker(site.x, site.y, 0x88ff88, 'build', 'Строить');
+    this.audio.play('build');
+    this.cancelPlacement();
+  }
+
+  private updatePlacementGhost(wx: number, wy: number): void {
+    if (!this.placementKind || !this.placementGhost) return;
+    const { tx, ty } = this.tileFromWorld(wx, wy);
+    const size = BUILDING[this.placementKind].size;
+    this.placementGhost.setPosition(tx * TILE + (size * TILE) / 2, ty * TILE + (size * TILE) / 2);
+    const ok = this.canPlace(tx, ty, this.placementKind);
+    this.placementGhost.setTint(ok ? COLORS.ghostOk : COLORS.ghostBad);
+    this.placementGhost.setAlpha(ok ? 0.78 : 0.54);
+    this.drawFootprint(tx, ty, size, ok);
+  }
+
+  private drawFootprint(tx: number, ty: number, size: number, ok: boolean): void {
+    this.footprint.clear();
+    this.footprint.lineStyle(1, ok ? COLORS.ghostOk : COLORS.ghostBad, 0.95);
+    this.footprint.fillStyle(ok ? COLORS.ghostOk : COLORS.ghostBad, 0.18);
+    for (let dy = 0; dy < size; dy++) {
+      for (let dx = 0; dx < size; dx++) {
+        this.footprint.fillRect((tx + dx) * TILE, (ty + dy) * TILE, TILE, TILE);
+        this.footprint.strokeRect((tx + dx) * TILE + 1, (ty + dy) * TILE + 1, TILE - 2, TILE - 2);
+      }
+    }
+  }
+
+  private describeMissing(side: Side, cost: EconCost): string {
+    const parts = this.economy.missingAmounts(side, cost)
+      .map(({ res, need }) => `${RES_LABEL[res]} ${need}`);
+    return `Не вистачає: ${parts.join(', ')}`;
+  }
+
+  requestTrain(kind: UnitKind): void {
+    const storyLock = this.getStoryTrainLock(kind);
+    if (storyLock) {
+      this.flashMessage(storyLock);
+      this.audio.play('error');
+      return;
+    }
+    const b = this.selectedBuilding;
+    if (!b || b.side !== SIDE.player || !b.completed) return;
+    const producer = UNIT[kind].producer as BuildingKind;
+    if (b.buildingKind !== producer) { this.flashMessage('Это здание не производит этого юнита'); this.audio.play('error'); return; }
+    const requires = UNIT[kind].requires as BuildingKind | undefined;
+    if (requires && !this.buildings.some(x => x.alive && x.completed && x.side === SIDE.player && x.buildingKind === requires)) {
+      this.flashMessage(`Нужно здание: ${BUILDING[requires].labelByRace[this.playerRace]}`);
+      this.audio.play('error');
+      return;
+    }
+    const def = UNIT[kind];
+    if (b.queue.length >= 5) { this.flashMessage('Очередь заполнена'); this.audio.play('error'); return; }
+    if (!this.economy.canAfford(SIDE.player, def.cost)) { this.flashMessage(this.describeMissing(SIDE.player, def.cost)); this.audio.play('error'); return; }
+    if (!this.economy.hasPopRoom(SIDE.player, def.food)) { this.flashMessage('Не вистачає людей — будуйте хати'); this.audio.play('error'); return; }
+    this.economy.spend(SIDE.player, def.cost);
+    b.enqueue(kind);
+    this.audio.play('train');
+    this.game.events.emit('selection-changed', { units: this.selected, building: this.selectedBuilding });
+  }
+
+  private tryTrainHotkey(kind: UnitKind): void {
+    if (!this.selectedBuilding) return;
+    this.requestTrain(kind);
+  }
+
+  /** Тест-режим: безлімітні ресурси + миттєве знищення ворогів атаками гравця. F9. */
+  private toggleTestMode(): void {
+    this.testMode = !this.testMode;
+    if (this.testMode) {
+      this.applyTestResources();
+      this.flashMessage('ТЕСТ-РЕЖИМ: безлімітні ресурси, миттєві вбивства (F9 — вимкнути, "+" / "-" — швидкість)');
+    } else {
+      this.testSpeedMul = 1;
+      this.time.timeScale = 1;
+      this.tweens.timeScale = 1;
+      this.flashMessage('Тест-режим вимкнено');
+    }
+  }
+
+  private applyTestResources(): void {
+    const TEST_AMOUNT = 99999;
+    for (const side of [SIDE.player, SIDE.ai]) {
+      const p = this.economy.get(side);
+      if (!p) continue;
+      p.gold = TEST_AMOUNT;
+      p.lumber = TEST_AMOUNT;
+      p.salt = TEST_AMOUNT;
+      p.food = TEST_AMOUNT;
+      p.popCap = 999;
+    }
+    this.economy.events.emit('changed', SIDE.player);
+  }
+
+  /** F10/F11: цикл швидкості гри x1/x2/x4/x8 (впливає на симуляцію та таймери). */
+  private cycleTestSpeed(dir: number): void {
+    const steps = [1, 2, 4, 8];
+    let idx = steps.indexOf(this.testSpeedMul);
+    if (idx < 0) idx = 0;
+    idx = Phaser.Math.Clamp(idx + dir, 0, steps.length - 1);
+    this.testSpeedMul = steps[idx];
+    this.time.timeScale = this.testSpeedMul;
+    this.tweens.timeScale = this.testSpeedMul;
+    this.flashMessage(`Швидкість гри: x${this.testSpeedMul}`);
+  }
+
+  update(_t: number, dt: number): void {
+    if (this.gameOver) return;
+    if (this.testMode) {
+      this.applyTestResources();
+      dt *= this.testSpeedMul;
+    } else if (this.testSpeedMul !== 1) {
+      dt *= this.testSpeedMul;
+    }
+    this.simTimeMs += dt;
+    if (this.debugPerf) this.recordPerfFrame(dt);
+    this.repathsThisFrame = 0;
+    this.updateCamera(dt);
+    this.updateStoryAtmosphereOverlay();
+    this.effects.ambientViewportTick(dt, this.cameras.main.worldView, this.storyAtmosphereTone);
+    this.rebuildUnitSpatialIndex();
+    runPlayerAutopilot(this);
+    this.updateUnits(dt);
+    this.updateAnimals(dt);
+    this.updateCaravans(dt);
+    this.rebuildUnitSpatialIndex();
+    this.updateBuildings(dt);
+    this.updateProjectiles(dt);
+    this.updateSelectionRingsFollow();
+    this.drawRally();
+    this.lastCombatTickMs += dt;
+    if (this.lastCombatTickMs >= 200) { this.combatTick(); this.lastCombatTickMs = 0; }
+    this.lastFogTickMs += dt;
+    const fogUpdateMs = this.currentFogUpdateMs();
+    if (this.lastFogTickMs >= fogUpdateMs) { this.updateFog(); this.lastFogTickMs = 0; }
+    this.lastAITickMs += dt;
+    if (this.mode === 'skirmish' && !this.debugPathfinding && !this.debugPerf && this.lastAITickMs >= DIFFICULTY[this.difficulty].aiDelayMs) {
+      runAI(this, this.aiState, this.difficulty);
+      this.lastAITickMs = 0;
+    }
+    this.storyController?.update(this.simTimeMs, dt);
+    if (this.debugPathfinding) this.updateDebugPathfinding();
+    if (this.debugPerf) this.updateDebugPerf(fogUpdateMs);
+    else if (!this.debugPathfinding) this.checkVictory();
+    this.pruneDead();
+  }
+
+  private updateDebugPathfinding(): void {
+    if (!this.debugPathfindingText) return;
+    const stats = getPathfindingStats();
+    const elapsed = Math.max(0, (this.time.now - this.debugPathfindingStartMs) / 1000);
+    const units = this.debugPathfindingUnits.filter(u => u.alive);
+    const moving = units.filter(u => u.state === 'move' || u.state === 'attack_move').length;
+    const stuck = units.filter(u => u.path.length > 0 && u.pathStuckMs >= STUCK_REPATH_MS).length;
+    const arrived = units.length - moving;
+    const maxStuckMs = units.reduce((best, u) => Math.max(best, u.pathStuckMs), 0);
+    const lines = [
+      'debugPathfinding=1',
+      `t=${elapsed.toFixed(1)}s units=${units.length} moving=${moving} arrived=${arrived} stuck=${stuck}`,
+      `findPath calls=${stats.calls} avg=${stats.avgMs.toFixed(2)}ms max=${stats.maxMs.toFixed(2)}ms`,
+      `iter avg=${stats.avgIterations.toFixed(0)} max=${stats.maxIterations} limit=${stats.limitHits} empty=${stats.emptyResults}`,
+      `frame repaths=${this.repathsThisFrame}/${MAX_REPATHS_PER_FRAME} maxStuck=${Math.round(maxStuckMs)}ms`
+    ];
+    this.debugPathfindingText.setText(lines.join('\n'));
+    if (this.time.now < this.debugPathfindingNextLogMs) return;
+    this.debugPathfindingNextLogMs = this.time.now + 2000;
+    console.log(`[path-debug] ${lines.slice(1).join(' | ')}`);
+  }
+
+  private recordPerfFrame(dt: number): void {
+    this.perfFrameSamples.push(dt);
+    if (this.perfFrameSamples.length > 240) this.perfFrameSamples.shift();
+  }
+
+  private updateDebugPerf(fogUpdateMs: number): void {
+    if (!this.debugPerfText || this.time.now < this.debugPerfNextDrawMs) return;
+    this.debugPerfNextDrawMs = this.time.now + 250;
+
+    const frames = this.perfFrameSamples;
+    const avgFrame = frames.length ? frames.reduce((sum, v) => sum + v, 0) / frames.length : 0;
+    const sorted = [...frames].sort((a, b) => a - b);
+    const p95 = sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))] : 0;
+
+    const pathStats = getPathfindingStats();
+    const elapsedSec = Math.max(0.001, (this.time.now - this.perfPathLastSampleMs) / 1000);
+    this.perfPathCallsPerSec = (pathStats.calls - this.perfPathLastCalls) / elapsedSec;
+    this.perfPathLastCalls = pathStats.calls;
+    this.perfPathLastSampleMs = this.time.now;
+
+    const health = getHealthBarStats();
+    const particles = this.effects.fx.getStats();
+    const effects = this.effects.getStats();
+    const liveUnits = this.units.filter(u => u.alive).length;
+    const moving = this.units.filter(u => u.alive && (u.state === 'move' || u.state === 'attack_move')).length;
+    const lines = [
+      `debugPerf=${this.debugPerfSize}  F6=100 F7=300 F8=500`,
+      `frame avg=${avgFrame.toFixed(1)}ms p95=${p95.toFixed(1)}ms samples=${frames.length}`,
+      `units=${liveUnits} moving=${moving} projectiles=${this.projectiles.length}`,
+      `particles active~${particles.activeApprox} budget=${particles.budgetUsed}/${particles.budgetLimit} dropped=${particles.dropped}`,
+      `effects texts=${effects.floatingTexts} decals=${effects.decals} pools t/i=${effects.pooledTexts}/${effects.pooledImages}`,
+      `health calls=${health.calls} redraws=${health.redraws} hidden=${health.skippedHidden} full=${health.skippedFull} throttle=${health.skippedThrottle}`,
+      `fog last=${this.fogLastMs.toFixed(2)}ms avg=${this.fogAvgMs.toFixed(2)}ms interval=${fogUpdateMs}ms`,
+      `path ${this.perfPathCallsPerSec.toFixed(1)}/s calls=${pathStats.calls} avg=${pathStats.avgMs.toFixed(2)}ms max=${pathStats.maxMs.toFixed(2)}ms`
+    ];
+    this.debugPerfText.setText(lines.join('\n'));
+  }
+
+  private rebuildUnitSpatialIndex(): void {
+    this.unitSpatial.rebuild(this.units);
+    this.unitSpatialReady = true;
+  }
+
+  private queryUnitsInRadius(x: number, y: number, radius: number): Unit[] {
+    if (this.unitSpatialReady) return this.unitSpatial.queryRadius(x, y, radius, this.unitQueryScratch);
+    this.unitQueryScratch.length = 0;
+    const r2 = radius * radius;
+    for (const unit of this.units) {
+      if (!unit.alive) continue;
+      const dx = unit.x - x;
+      const dy = unit.y - y;
+      if (dx * dx + dy * dy <= r2) this.unitQueryScratch.push(unit);
+    }
+    return this.unitQueryScratch;
+  }
+
+  private currentFogUpdateMs(): number {
+    const active = this.units.length + this.projectiles.length + this.caravans.length;
+    if (active >= 500) return FOG.updateMs * 2;
+    if (active >= 300) return Math.round(FOG.updateMs * 1.5);
+    if (active >= 100) return Math.round(FOG.updateMs * 1.2);
+    return FOG.updateMs;
+  }
+
+  private updateSelectionRingsFollow(): void {
+    for (const r of this.selectionRings) {
+      const u = r.getData('follow') as Unit;
+      if (!u || !u.alive) { r.destroy(); continue; }
+      r.setPosition(u.x, u.y);
+    }
+    this.selectionRings = this.selectionRings.filter(r => r.active);
+    if (this.buildingSelectionRing && this.selectedBuilding && !this.selectedBuilding.alive) {
+      this.buildingSelectionRing.destroy();
+      this.buildingSelectionRing = null;
+      this.selectedBuilding = null;
+      this.game.events.emit('selection-changed', { units: this.selected, building: this.selectedBuilding });
+    }
+    if (this.buildingSelectionRing && this.selectedBuilding) this.buildingSelectionRing.setPosition(this.selectedBuilding.x, this.selectedBuilding.y);
+  }
+
+  private updateCamera(dt: number): void {
+    if (this.isStoryControlLocked()) {
+      this.cameraVel.x = 0;
+      this.cameraVel.y = 0;
+      return;
+    }
+    const cam = this.cameras.main;
+    const zoom = cam.zoom || 1;
+    const speed = (CAMERA_SPEED * dt) / 1000 / zoom;
+    let dx = 0, dy = 0;
+    if (this.cursorKeys.up?.isDown || this.wasdKeys.W.isDown) dy -= 1;
+    if (this.cursorKeys.down?.isDown || this.wasdKeys.S.isDown) dy += 1;
+    if (this.cursorKeys.left?.isDown || this.wasdKeys.A.isDown) dx -= 1;
+    if (this.cursorKeys.right?.isDown || this.wasdKeys.D.isDown) dx += 1;
+
+    const p = this.input.activePointer;
+    if (p && !p.isDown) {
+      if (p.x < EDGE_SCROLL_PX) dx -= 1;
+      if (p.x > VIEW_W - EDGE_SCROLL_PX) dx += 1;
+      if (p.y < EDGE_SCROLL_PX) dy -= 1;
+      if (p.y > VIEW_H - EDGE_SCROLL_PX) dy += 1;
+    }
+    const len = Math.hypot(dx, dy) || 1;
+    const targetX = dx ? (dx / len) * speed : 0;
+    const targetY = dy ? (dy / len) * speed : 0;
+    this.cameraVel.x = Phaser.Math.Linear(this.cameraVel.x * FEEL.cameraFriction, targetX, FEEL.cameraSmoothing);
+    this.cameraVel.y = Phaser.Math.Linear(this.cameraVel.y * FEEL.cameraFriction, targetY, FEEL.cameraSmoothing);
+    if (Math.abs(this.cameraVel.x) < 0.01) this.cameraVel.x = 0;
+    if (Math.abs(this.cameraVel.y) < 0.01) this.cameraVel.y = 0;
+    const viewW = cam.width / zoom;
+    const viewH = cam.height / zoom;
+    cam.scrollX = Phaser.Math.Clamp(cam.scrollX + this.cameraVel.x, 0, Math.max(0, WORLD_W - viewW));
+    cam.scrollY = Phaser.Math.Clamp(cam.scrollY + this.cameraVel.y, 0, Math.max(0, WORLD_H - viewH));
+  }
+
+  private isStoryControlLocked(): boolean {
+    return this.time.now < this.storyControlLockUntilMs;
+  }
+
+  private updateUnits(dt: number): void {
+    for (const u of this.units) {
+      if (!u.alive) continue;
+      this.updateUnit(u, dt);
+      u.update();
+    }
+  }
+
+  private updateUnit(u: Unit, dt: number): void {
+    u.pathRepathMs += dt;
+    switch (u.state) {
+      case 'idle': this.tickIdle(u); break;
+      case 'move': this.tickMove(u, dt); break;
+      case 'attack_move': this.tickAttackMove(u, dt); break;
+      case 'attack': this.tickAttack(u, dt); break;
+      case 'gather': this.tickGather(u, dt); break;
+      case 'return_cargo': this.tickReturnCargo(u, dt); break;
+      case 'build': this.tickBuild(u, dt); break;
+    }
+  }
+
+  private tickIdle(u: Unit): void {
+    if (!u.canAttack()) return;
+    const target = this.acquireTarget(u, u.sight * TILE);
+    if (target) this.assignAttackTarget(u, target);
+  }
+
+  private tickMove(u: Unit, dt: number): void {
+    if (!this.stepPath(u, dt)) {
+      this.finishMovement(u);
+      u.state = 'idle';
+    }
+  }
+
+  private tickAttackMove(u: Unit, dt: number): void {
+    const tgt = this.acquireTarget(u, u.sight * TILE);
+    if (tgt) { this.assignAttackTarget(u, tgt); return; }
+    if (!this.stepPath(u, dt)) {
+      this.finishMovement(u);
+      u.state = 'idle';
+      u.attackMoveTo = null;
+    }
+  }
+
+  private finishMovement(u: Unit): void {
+    u.groupMoveId = 0;
+    u.groupSlot = null;
+    u.pathWaitMs = 0;
+    u.pathStuckMs = 0;
+    u.nextRepathAtMs = 0;
+    u.moveIntentX = 0;
+    u.moveIntentY = 0;
+  }
+
+  private tickAttack(u: Unit, dt: number): void {
+    let tgt: IEntity | null = u.targetUnit && u.targetUnit.alive ? u.targetUnit : null;
+    if (!tgt) tgt = u.targetBuilding && u.targetBuilding.alive ? u.targetBuilding : null;
+    // Якщо ціль — нейтральний караван, але поруч є бойові юніти, що атакують —
+    // переключаємось на них замість того, щоб тупо добивати віз
+    if (tgt && tgt.kind === 'caravan') {
+      const threat = this.acquireTarget(u, u.sight * TILE);
+      if (threat) { this.assignAttackTarget(u, threat); tgt = threat; }
+    }
+    if (!tgt) {
+      if (u.attackMoveTo) { u.state = 'attack_move'; this.repath(u, u.attackMoveTo.x, u.attackMoveTo.y, 'attack-move'); return; }
+      u.state = 'idle'; u.targetUnit = null; u.targetBuilding = null; return;
+    }
+    const dist = Phaser.Math.Distance.Between(u.x, u.y, tgt.x, tgt.y);
+    const effectiveRange = u.range + tgt.radius + u.radius + (tgt.kind === 'building' ? TILE * 0.65 : 0);
+    if (dist > effectiveRange) {
+      if (u.path.length === 0 || u.pathRepathMs > 500) this.repath(u, tgt.x, tgt.y, 'target');
+      this.stepPath(u, dt);
+      return;
+    }
+    const now = this.time.now;
+    if (now - u.lastAttack >= u.cooldown) {
+      u.lastAttack = now;
+      const bonus = tgt.kind === 'building' ? UNIT[u.unitKind].bonusVsBuilding ?? 0 : 0;
+      const damage = u.atk + bonus;
+
+      u.playAttackSwing();
+
+      if (u.isRanged()) this.spawnProjectile(u, tgt, damage, UNIT[u.unitKind].splashRadius ?? 0);
+      else this.dealDamage(tgt, damage, u);
+      if (tgt.kind === 'unit' && tgt.alive) {
+        const vic = tgt as Unit;
+        if (vic.canAttack() && !vic.targetUnit && !vic.targetBuilding) this.assignAttackTarget(vic, u);
+      }
+    }
+  }
+
+  private tickGather(u: Unit, dt: number): void {
+    const node = u.targetResource;
+    if (!node || !node.alive) {
+      if (u.cargo) { this.returnToNearestHall(u); return; }
+      const lastType = node?.resourceType === 'lumber' ? 'lumber' : 'gold';
+      u.resourceApproach = null;
+      const newNode = this.findNearestResource(u, lastType);
+      if (newNode) this.orderGather(u, newNode);
+      else u.state = 'idle';
+      return;
+    }
+    const dist = this.distanceToResourceFootprint(u.x, u.y, node);
+    if (!this.canGatherResource(u, dist)) {
+      const approach = this.ensureResourceApproach(u, node);
+      const dest = approach ?? { x: node.x, y: node.y };
+      if (this.shouldRepathTo(u, dest)) this.repath(u, dest.x, dest.y, 'resource');
+      this.stepPath(u, dt);
+      return;
+    }
+    u.path = [];
+    u.moveIntentX = 0;
+    u.moveIntentY = 0;
+    if (u.gatherAccum === 0) u.playWorkSwing('gather');
+    const prevGather = u.gatherAccum;
+    u.gatherAccum += dt;
+    if (Math.floor(prevGather / FEEL.gatherWorkPulseMs) !== Math.floor(u.gatherAccum / FEEL.gatherWorkPulseMs)) {
+      u.playWorkSwing('gather');
+      if (u.side === SIDE.player && node.sprite.visible) {
+        this.effects.gatherImpact(node.x, node.y, node.resourceType);
+        this.audio.play('gather', 0.28, u.x);
+      }
+    }
+    if (u.gatherAccum >= RESOURCE.gatherTime) {
+      u.gatherAccum = 0;
+      const n = node.harvest(RESOURCE.workerCarry);
+      if (!node.alive && node.resourceType === 'lumber') this.map.setWalkable(node.tx, node.ty, true);
+      if (!node.alive && node.resourceType === 'salt') {
+        for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++) this.map.setWalkable(node.tx + dx, node.ty + dy, true);
+      }
+      if (n > 0) {
+        u.cargo = { type: node.resourceType, amount: n };
+        if (u.side === SIDE.player) {
+          this.effects.resourceText(u.x, u.y, `+${n}`, node.resourceType);
+          this.effects.gatherImpact(u.x, u.y, node.resourceType);
+        }
+        this.returnToNearestHall(u);
+      }
+    }
+  }
+
+  private tickReturnCargo(u: Unit, dt: number): void {
+    if (!u.cargo) { u.state = 'idle'; return; }
+    const saltPoint = this.storyMapDefinition?.saltCollectionPoint;
+    if (u.cargo.type === 'salt' && saltPoint) {
+      const dist = Phaser.Math.Distance.Between(u.x, u.y, saltPoint.x, saltPoint.y);
+      if (dist > u.radius + TILE * 1.5) {
+        if (u.path.length === 0 || u.pathRepathMs > 500) this.repath(u, saltPoint.x, saltPoint.y, 'return');
+        this.stepPath(u, dt);
+        return;
+      }
+      this.depositCargo(u, saltPoint.x, saltPoint.y);
+      return;
+    }
+    let hall = u.returnTo && u.returnTo.alive ? u.returnTo : null;
+    if (!hall) hall = this.findNearestHall(u);
+    if (!hall) { this.depositCargo(u, u.x, u.y); return; }
+    const dist = Phaser.Math.Distance.Between(u.x, u.y, hall.x, hall.y);
+    if (dist > hall.radius + u.radius + TILE * 1.5) {
+      if (u.path.length === 0 || u.pathRepathMs > 500) this.repath(u, hall.x, hall.y, 'return');
+      this.stepPath(u, dt);
+      return;
+    }
+    this.depositCargo(u, hall.x, hall.y);
+  }
+
+  /** Здає вантаж (у хутір або, якщо хутора ще нема, прямо на місці — валка везе з собою) і шукає нову роботу. */
+  private depositCargo(u: Unit, depositX: number, depositY: number): void {
+    const cargo = u.cargo;
+    if (!cargo) { u.state = 'idle'; return; }
+    const deposited = Math.round(cargo.amount * (u.side === SIDE.ai ? DIFFICULTY[this.difficulty].incomeBias : 1));
+    this.economy.deposit(u.side, cargo.type, deposited);
+    this.emitStoryEvent({ type: 'resourceGathered', side: u.side, resourceType: cargo.type, amount: cargo.amount });
+    if (this.mode === 'skirmish' && u.side === SIDE.player) this.skirmishStats.resourcesGathered[cargo.type] += cargo.amount;
+    if (u.side === SIDE.player) {
+      this.effects.resourceText(depositX, depositY, `+${cargo.amount} ${RES_LETTER[cargo.type]}`, cargo.type);
+      this.audio.play('deposit', 0.45);
+    }
+    const lastNode = u.targetResource;
+    const lastType = cargo.type === 'lumber' ? 'lumber' : 'gold';
+    u.cargo = null;
+    u.returnTo = null;
+    if (lastNode && lastNode.alive) this.orderGather(u, lastNode);
+    else {
+      const t = this.findNearestResource(u, lastType);
+      if (t) this.orderGather(u, t);
+      else u.state = 'idle';
+    }
+  }
+
+  private tickBuild(u: Unit, dt: number): void {
+    const site = u.targetBuilding;
+    if (!site || !site.alive) { u.state = 'idle'; u.targetBuilding = null; return; }
+    if (site.completed) { u.state = 'idle'; u.targetBuilding = null; return; }
+    const dist = Phaser.Math.Distance.Between(u.x, u.y, site.x, site.y);
+    if (dist > site.radius + u.radius + TILE * 1.5) {
+      if (u.path.length === 0 || u.pathRepathMs > 500) this.repath(u, site.x, site.y, 'build');
+      this.stepPath(u, dt);
+      return;
+    }
+    u.path = [];
+    const prevBuild = site.buildProgress;
+    const done = site.addBuildProgress(dt);
+    if (Math.floor(prevBuild / FEEL.buildWorkPulseMs) !== Math.floor(site.buildProgress / FEEL.buildWorkPulseMs)) {
+      u.playWorkSwing('build');
+      if (site.sprite.visible) this.effects.buildProgressPulse(site.x, site.y, site.radius);
+    }
+    if (done) {
+      const def = BUILDING[site.buildingKind];
+      if (site.buildingKind === 'townhall' || site.buildingKind === 'farm') this.economy.addCap(site.side, def.food);
+      this.effects.buildingComplete(site.x, site.y, RACE_COLOR[site.race]);
+      this.emitStoryEvent({ type: 'buildingCompleted', buildingId: site.id, buildingKind: site.buildingKind, side: site.side });
+      if (site.side === SIDE.player) this.audio.play('build');
+      u.state = 'idle'; u.targetBuilding = null;
+    }
+  }
+
+  private stepPath(u: Unit, dt: number): boolean {
+    if (u.path.length === 0) {
+      u.moveIntentX = 0;
+      u.moveIntentY = 0;
+      return false;
+    }
+    if (this.isSettledAtGroupSlot(u, GROUP_SLOT_ARRIVAL_RADIUS)) {
+      u.path = [];
+      u.moveIntentX = 0;
+      u.moveIntentY = 0;
+      return false;
+    }
+    const slowed = this.time.now < u.slowUntilMs ? u.slowFactor : 1;
+    const step = (u.speed * slowed * dt) / 1000;
+    const next = u.path[0];
+    const dx = next.x - u.x;
+    const dy = next.y - u.y;
+    const d = Math.hypot(dx, dy);
+    if (d <= step) {
+      u.moveIntentX = d > 0.01 ? dx / d : 0;
+      u.moveIntentY = d > 0.01 ? dy / d : 0;
+      u.x = next.x; u.y = next.y;
+      u.path.shift();
+      if (u.path.length === 0) {
+        u.moveIntentX = 0;
+        u.moveIntentY = 0;
+      }
+      this.trackPathProgress(u, dt);
+      return true;
+    }
+
+    const desiredX = dx / d;
+    const desiredY = dy / d;
+    const trafficSpeed = this.trafficSpeedFactor(u, next, desiredX, desiredY);
+    u.pathWaitMs = trafficSpeed < 0.99 ? u.pathWaitMs + dt : 0;
+    const steer = this.steeringDirection(u, next, desiredX, desiredY);
+    u.moveIntentX = steer.x;
+    u.moveIntentY = steer.y;
+    const adjustedStep = step * trafficSpeed;
+    if (!this.tryMoveUnit(u, steer.x * adjustedStep, steer.y * adjustedStep)) {
+      this.tryMoveUnit(u, desiredX * adjustedStep, desiredY * adjustedStep);
+    }
+    this.trackPathProgress(u, dt);
+    return true;
+  }
+
+  private isSettledAtGroupSlot(u: Unit, radius: number): boolean {
+    return !!u.groupSlot && Phaser.Math.Distance.Between(u.x, u.y, u.groupSlot.x, u.groupSlot.y) <= radius;
+  }
+
+  private trafficSpeedFactor(u: Unit, next: Point, desiredX: number, desiredY: number): number {
+    if (this.isSettledAtGroupSlot(u, GROUP_SLOT_SETTLE_RADIUS)) return 1;
+    const distToNext = Phaser.Math.Distance.Between(u.x, u.y, next.x, next.y);
+    let slow = 1;
+    for (const other of this.queryUnitsInRadius(u.x, u.y, u.radius + 84)) {
+      if (!other.alive || other === u || other.side !== u.side) continue;
+      const ox = other.x - u.x;
+      const oy = other.y - u.y;
+      const ahead = ox * desiredX + oy * desiredY;
+      if (ahead <= 0) continue;
+      const lateral = Math.abs(ox * desiredY - oy * desiredX);
+      const min = u.radius + other.radius + 8;
+      if (ahead > min * 1.8 || lateral > min * 0.8) continue;
+      const otherToNext = Phaser.Math.Distance.Between(other.x, other.y, next.x, next.y);
+      if (otherToNext < distToNext || other.id < u.id) slow = Math.min(slow, 0.35);
+    }
+    if (u.pathWaitMs > 650) slow = Math.max(slow, 0.62);
+    return slow;
+  }
+
+  private steeringDirection(u: Unit, next: Point, desiredX: number, desiredY: number): Point {
+    if (this.isSettledAtGroupSlot(u, GROUP_SLOT_SETTLE_RADIUS)) return { x: desiredX, y: desiredY };
+    const avoidanceScale = this.groupSlotAvoidanceScale(u);
+    let avoidX = 0;
+    let avoidY = 0;
+    if (avoidanceScale > 0) {
+      for (const other of this.queryUnitsInRadius(u.x, u.y, u.radius + 72)) {
+        if (!other.alive || other === u || other.side !== u.side) continue;
+        const dx = u.x - other.x;
+        const dy = u.y - other.y;
+        const d = Math.hypot(dx, dy);
+        const range = u.radius + other.radius + 14;
+        if (d <= 0.01 || d >= range) continue;
+        const weight = (range - d) / range;
+        avoidX += (dx / d) * weight;
+        avoidY += (dy / d) * weight;
+      }
+    }
+    const x = desiredX + avoidX * 0.85 * avoidanceScale;
+    const y = desiredY + avoidY * 0.85 * avoidanceScale;
+    const len = Math.hypot(x, y);
+    if (len <= 0.01) return { x: desiredX, y: desiredY };
+    return { x: x / len, y: y / len };
+  }
+
+  private groupSlotAvoidanceScale(u: Unit): number {
+    if (!u.groupSlot) return 1;
+    const d = Phaser.Math.Distance.Between(u.x, u.y, u.groupSlot.x, u.groupSlot.y);
+    return Phaser.Math.Clamp((d - GROUP_SLOT_SETTLE_RADIUS) / Math.max(1, GROUP_SLOT_AVOID_FADE_RADIUS - GROUP_SLOT_SETTLE_RADIUS), 0, 1);
+  }
+
+  private tryMoveUnit(u: Unit, dx: number, dy: number): boolean {
+    const nx = Phaser.Math.Clamp(u.x + dx, 0, WORLD_W - 1);
+    const ny = Phaser.Math.Clamp(u.y + dy, 0, WORLD_H - 1);
+    const t = this.map.worldToTile(nx, ny);
+    if (!this.map.isWalkable(t.tx, t.ty)) return false;
+    u.x = nx;
+    u.y = ny;
+    return true;
+  }
+
+  private trackPathProgress(u: Unit, dt: number): void {
+    if (u.path.length === 0) {
+      u.pathStuckMs = 0;
+      u.pathProgressX = u.x;
+      u.pathProgressY = u.y;
+      return;
+    }
+
+    const moved = Phaser.Math.Distance.Between(u.x, u.y, u.pathProgressX, u.pathProgressY);
+    if (moved >= STUCK_PROGRESS_PX) {
+      u.pathStuckMs = 0;
+      u.pathProgressX = u.x;
+      u.pathProgressY = u.y;
+      return;
+    }
+
+    u.pathStuckMs += dt;
+    if (u.pathStuckMs < STUCK_REPATH_MS || !u.pathDest) return;
+    const dest = u.groupSlot ?? u.pathDest;
+    if (this.repath(u, dest.x, dest.y, 'stuck')) {
+      u.pathStuckMs = 0;
+      u.pathProgressX = u.x;
+      u.pathProgressY = u.y;
+    } else if (this.time.now < u.nextRepathAtMs) {
+      u.pathStuckMs = Math.min(u.pathStuckMs, STUCK_REPATH_MS);
+    }
+  }
+
+  /** Вибраний характерник гравця (для здібності). */
+  selectedKharakternyk(): Unit | null {
+    return this.selected.find(u => u.alive && u.unitKind === 'kharakternyk' && u.side === SIDE.player) ?? null;
+  }
+
+  private beginCastTumanets(): void {
+    const caster = this.selectedKharakternyk();
+    if (!caster) return;
+    const now = this.time.now;
+    if (now < caster.abilityReadyAt) {
+      this.flashMessage(`Туманець ще не зібрався (${Math.ceil((caster.abilityReadyAt - now) / 1000)} с)`);
+      this.audio.play('error');
+      return;
+    }
+    this.cancelPlacement();
+    this.setAttackMoveMode(false);
+    this.setCastTumanetsMode(true);
+  }
+
+  private setCastTumanetsMode(v: boolean): void {
+    this.castTumanetsMode = v;
+    this.game.events.emit('ui-mode', v ? 'Туманець: ЛКМ по землі — накрити місце імлою' : '');
+  }
+
+  private castTumanets(wx: number, wy: number): void {
+    const caster = this.selectedKharakternyk();
+    if (!caster) return;
+    const now = this.time.now;
+    if (now < caster.abilityReadyAt) { this.audio.play('error'); return; }
+    const dist = Phaser.Math.Distance.Between(caster.x, caster.y, wx, wy);
+    if (dist > TUMANETS.castRange) {
+      this.flashMessage('Задалеко — підійдіть ближче');
+      this.audio.play('error');
+      return;
+    }
+    caster.abilityReadyAt = now + TUMANETS.cooldownMs;
+    const until = now + TUMANETS.durationMs;
+    for (const u of this.queryUnitsInRadius(wx, wy, TUMANETS.radius)) {
+      if (!u.alive || u.side === caster.side) continue;
+      u.slowUntilMs = until;
+      u.slowFactor = TUMANETS.slowFactor;
+    }
+    for (const a of this.animals) {
+      if (!a.alive) continue;
+      if (Phaser.Math.Distance.Between(a.x, a.y, wx, wy) > TUMANETS.radius) continue;
+      a.slowUntilMs = until;
+      a.slowFactor = TUMANETS.slowFactor;
+      if (ANIMAL[a.animalKind].predator) a.huntTarget = null; // вовки гублять слід в імлі
+    }
+    this.effects.tumanetsCloud(wx, wy, TUMANETS.radius, TUMANETS.durationMs);
+    this.audio.play('alert', 0.35, wx);
+    this.game.events.emit('selection-changed', { units: this.selected, building: this.selectedBuilding });
+  }
+
+  private updateAnimals(dt: number): void {
+    for (const a of this.animals) {
+      if (!a.alive) continue;
+      const def = ANIMAL[a.animalKind];
+      if (def.predator) this.tickWolf(a, def);
+      else if (def.retaliates) this.tickBoarRetaliate(a, def);
+      else if (a.animalKind === 'wolf_den') this.tickWolfDen(a);
+      a.update(dt);
+      a.setVisible(this.isVisibleEntity(a));
+    }
+  }
+
+  /** Вовк: агро на юнітів (та оленів) поблизу, укус по кулдауну, повідець до домівки. */
+  private tickWolf(wolf: Animal, def: (typeof ANIMAL)['wolf']): void {
+    // повідець: задалеко від домівки — кидаємо ціль і вертаємось
+    const homeDist = Math.hypot(wolf.x - wolf.homeX, wolf.y - wolf.homeY);
+    if (homeDist > def.leashRange) {
+      wolf.huntTarget = null;
+      return;
+    }
+    // ціль здохла/втекла за агро*1.6 — кидаємо
+    if (wolf.huntTarget && (!wolf.huntTarget.alive ||
+        Phaser.Math.Distance.Between(wolf.x, wolf.y, wolf.huntTarget.x, wolf.huntTarget.y) > def.aggroRange * 1.6)) {
+      wolf.huntTarget = null;
+    }
+    // шукаємо здобич: найближчий юніт, як нема — олень/вепр
+    if (!wolf.huntTarget) {
+      let best: IEntity | null = null;
+      let bestD = def.aggroRange;
+      for (const u of this.queryUnitsInRadius(wolf.x, wolf.y, def.aggroRange)) {
+        if (!u.alive || u.side === SIDE.neutral) continue;
+        const d = Phaser.Math.Distance.Between(wolf.x, wolf.y, u.x, u.y);
+        if (d < bestD) { bestD = d; best = u; }
+      }
+      if (!best) {
+        for (const prey of this.animals) {
+          if (!prey.alive || ANIMAL[prey.animalKind].predator || ANIMAL[prey.animalKind].speed === 0) continue;
+          const d = Phaser.Math.Distance.Between(wolf.x, wolf.y, prey.x, prey.y);
+          if (d < bestD * 0.8) { bestD = d; best = prey; }
+        }
+      }
+      wolf.huntTarget = best;
+    }
+    const tgt = wolf.huntTarget;
+    if (!tgt) return;
+    // укус
+    const dist = Phaser.Math.Distance.Between(wolf.x, wolf.y, tgt.x, tgt.y);
+    if (dist <= wolf.radius + tgt.radius + 7) {
+      const now = this.time.now;
+      if (now - wolf.lastBiteMs >= def.atkCooldownMs) {
+        wolf.lastBiteMs = now;
+        this.dealDamage(tgt, def.atk, wolf);
+        // жертва-боєць огризається
+        if (tgt.alive && tgt.kind === 'unit') {
+          const vic = tgt as Unit;
+          if (vic.canAttack() && !vic.targetUnit && !vic.targetBuilding && (vic.state === 'idle' || vic.state === 'gather' || vic.state === 'return_cargo')) {
+            this.assignAttackTarget(vic, wolf);
+          }
+        }
+      }
+    }
+  }
+
+  /** Вепр: огризається на кривдника, поки той живий і поруч, потім втрачає інтерес. */
+  private tickBoarRetaliate(boar: Animal, def: (typeof ANIMAL)['boar']): void {
+    const tgt = boar.huntTarget;
+    if (!tgt) return;
+    const now = this.time.now;
+    const dist = Phaser.Math.Distance.Between(boar.x, boar.y, tgt.x, tgt.y);
+    if (!tgt.alive || boar.retaliateUntilMs <= now || dist > def.radius + tgt.radius + TILE * 6) {
+      boar.huntTarget = null;
+      return;
+    }
+    if (dist <= boar.radius + tgt.radius + 7) {
+      if (now - boar.lastBiteMs >= def.atkCooldownMs) {
+        boar.lastBiteMs = now;
+        this.dealDamage(tgt, def.atk, boar);
+        if (tgt.alive && tgt.kind === 'unit') {
+          const vic = tgt as Unit;
+          if (vic.canAttack() && !vic.targetUnit && !vic.targetBuilding && (vic.state === 'idle' || vic.state === 'gather' || vic.state === 'return_cargo')) {
+            this.assignAttackTarget(vic, boar);
+          }
+        }
+      }
+    }
+  }
+
+  /** Лігво поволі поповнює зграю, поки його не зруйнували. */
+  private tickWolfDen(den: Animal): void {
+    const now = this.time.now;
+    if (den.nextRespawnMs === 0) den.nextRespawnMs = now + ANIMAL.denRespawnMs;
+    if (now < den.nextRespawnMs) return;
+    den.nextRespawnMs = now + ANIMAL.denRespawnMs;
+    const packSize = this.animals.filter(a =>
+      a.alive && a.animalKind === 'wolf' &&
+      Math.hypot(a.homeX - den.x, a.homeY - den.y) < TILE * 4
+    ).length;
+    if (packSize >= ANIMAL.denMaxWolves) return;
+    const ang = Math.random() * Math.PI * 2;
+    const wolf = new Animal(this, this.map, den.x + Math.cos(ang) * TILE, den.y + Math.sin(ang) * TILE, 'wolf');
+    wolf.homeX = den.x; wolf.homeY = den.y;
+    wolf.setVisible(this.isVisibleEntity(wolf));
+    this.animals.push(wolf);
+    if (this.isVisibleEntity(den)) this.effects.fx.dustPuff(den.x, den.y, false);
+  }
+
+  private updateCaravans(dt: number): void {
+    for (const caravan of this.caravans) {
+      if (!caravan.alive) continue;
+      caravan.update(dt);
+      if (!caravan.alive && caravan.routeComplete) {
+        this.emitStoryEvent({ type: 'caravanResolved', caravanId: caravan.id, outcome: 'escaped' });
+      }
+    }
+    if (this.time.now < this.caravanNextSpawnMs) return;
+    if (this.caravans.filter(c => c.alive).length >= CARAVAN_CONFIG.maxActive) return;
+    this.spawnCaravan();
+    this.scheduleNextCaravan(false);
+  }
+
+  private acquireTarget(u: Unit, range: number): IEntity | null {
+    let best: IEntity | null = null;
+    let bestD = Infinity;
+    for (const o of this.queryUnitsInRadius(u.x, u.y, range)) {
+      if (!o.alive || o.side === u.side || o.side === SIDE.neutral) continue;
+      const d = Phaser.Math.Distance.Between(u.x, u.y, o.x, o.y);
+      if (d < range && d < bestD) { best = o; bestD = d; }
+    }
+    for (const b of this.buildings) {
+      if (!b.alive || b.side === u.side) continue;
+      const d = Phaser.Math.Distance.Between(u.x, u.y, b.x, b.y);
+      if (d < range && d < bestD) { best = b; bestD = d; }
+    }
+    return best;
+  }
+
+  private assignAttackTarget(u: Unit, target: IEntity): void {
+    u.state = 'attack';
+    u.targetUnit = target instanceof Building ? null : target;
+    u.targetBuilding = target instanceof Building ? target : null;
+  }
+
+  /** Бойові юніти поруч кидаються на ворога, що атакує союзника, замість того щоб стояти. */
+  private alertNearbyAllies(victim: Unit, attacker: IEntity): void {
+    if (!attacker.alive) return;
+    const radius = TILE * 7;
+    for (const ally of this.queryUnitsInRadius(victim.x, victim.y, radius)) {
+      if (!ally.alive || ally === victim || ally.side !== victim.side || !ally.canAttack() || ally.isWorker()) continue;
+      if (ally.state === 'attack' || ally.state === 'attack_move') continue;
+      if (ally.targetUnit || ally.targetBuilding) continue;
+      this.assignAttackTarget(ally, attacker);
+    }
+  }
+
+  findNearestResource(u: Unit, type: 'gold' | 'lumber'): ResourceNode | null {
+    let best: ResourceNode | null = null;
+    let bestD = Infinity;
+    for (const r of this.resources) {
+      if (!r.alive || r.resourceType !== type) continue;
+      const d = Phaser.Math.Distance.Between(u.x, u.y, r.x, r.y);
+      if (d < bestD) { best = r; bestD = d; }
+    }
+    return best;
+  }
+
+  findNearestHall(u: Unit): Building | null {
+    let best: Building | null = null;
+    let bestD = Infinity;
+    for (const b of this.buildings) {
+      if (!b.alive || b.side !== u.side || b.buildingKind !== 'townhall' || !b.completed) continue;
+      const d = Phaser.Math.Distance.Between(u.x, u.y, b.x, b.y);
+      if (d < bestD) { best = b; bestD = d; }
+    }
+    return best;
+  }
+
+  private returnToNearestHall(u: Unit): void {
+    const saltPoint = this.storyMapDefinition?.saltCollectionPoint;
+    if (u.cargo?.type === 'salt' && saltPoint) {
+      u.groupMoveId = 0;
+      u.groupSlot = null;
+      u.pathWaitMs = 0;
+      u.returnTo = null;
+      u.state = 'return_cargo';
+      this.repath(u, saltPoint.x, saltPoint.y, 'return', { force: true });
+      return;
+    }
+    const h = this.findNearestHall(u);
+    if (!h) { this.depositCargo(u, u.x, u.y); return; }
+    u.groupMoveId = 0;
+    u.groupSlot = null;
+    u.pathWaitMs = 0;
+    u.returnTo = h;
+    u.state = 'return_cargo';
+    this.repath(u, h.x, h.y, 'return', { force: true });
+  }
+
+  private updateBuildings(dt: number): void {
+    for (const b of this.buildings) {
+      if (!b.alive) continue;
+      b.update();
+      this.tickBuildingAttack(b);
+      const produced = b.tickProduction(dt);
+      if (produced) this.finishProduction(b, produced);
+      const harvest = b.tickFood(dt);
+      if (harvest) this.economy.deposit(b.side, 'food', harvest);
+    }
+  }
+
+  private tickBuildingAttack(b: Building): void {
+    if (!b.canAttack()) return;
+    const target = this.acquireBuildingTarget(b);
+    if (!target) return;
+    const now = this.time.now;
+    if (now - b.lastAttack < b.cooldown) return;
+    b.lastAttack = now;
+    this.spawnProjectileFromBuilding(b, target);
+  }
+
+  private acquireBuildingTarget(b: Building): IEntity | null {
+    let best: IEntity | null = null;
+    let bestD = Infinity;
+    for (const u of this.queryUnitsInRadius(b.x, b.y, b.range)) {
+      if (!u.alive || u.side === b.side || u.side === SIDE.neutral) continue;
+      const d = Phaser.Math.Distance.Between(b.x, b.y, u.x, u.y);
+      if (d <= b.range && d < bestD) { best = u; bestD = d; }
+    }
+    return best;
+  }
+
+  private finishProduction(b: Building, produced: UnitKind): void {
+    const def = UNIT[produced];
+    if (!this.economy.hasPopRoom(b.side, def.food)) {
+      this.refund(b.side, def.cost.gold, def.cost.lumber);
+      if (b.side === SIDE.player) this.flashMessage('Производство отменено: нет снабжения');
+      return;
+    }
+    const spawnPos = this.findSpawnPoint(b);
+    if (!spawnPos) {
+      this.refund(b.side, def.cost.gold, def.cost.lumber);
+      if (b.side === SIDE.player) this.flashMessage('Нет места для выхода юнита');
+      return;
+    }
+    const u = this.spawnUnit(spawnPos.x, spawnPos.y, produced, b.side, b.race);
+    this.emitStoryEvent({ type: 'unitTrained', unitId: u.id, unitKind: produced, side: b.side });
+    this.effects.unitSpawn(spawnPos.x, spawnPos.y, RACE_COLOR[b.race]);
+    if (b.side === SIDE.player) this.audio.play('train');
+    if (b.rally) this.orderMove(u, b.rally.x, b.rally.y);
+  }
+
+  private refund(side: Side, gold: number, lumber: number): void {
+    if (gold) this.economy.deposit(side, 'gold', gold);
+    if (lumber) this.economy.deposit(side, 'lumber', lumber);
+  }
+
+  private findSpawnPoint(b: Building): { x: number; y: number } | null {
+    const start = b.centerTile();
+    // Спереду будівлі (нижче по Y) — пріоритетні клітинки, від центру до краю
+    const frontTy = b.ty + b.sizeTiles;
+    const frontCenterTx = b.tx + Math.floor((b.sizeTiles - 1) / 2);
+    for (let r = 0; r <= b.sizeTiles; r++) {
+      for (const tx of r === 0 ? [frontCenterTx] : [frontCenterTx - r, frontCenterTx + r]) {
+        if (!this.map.isWalkable(tx, frontTy)) continue;
+        const p = this.map.tileToWorld(tx, frontTy);
+        if (this.units.some(u => u.alive && Phaser.Math.Distance.Between(u.x, u.y, p.x, p.y) < u.radius + 16)) continue;
+        return p;
+      }
+    }
+    for (let r = b.sizeTiles; r <= b.sizeTiles + 8; r++) {
+      for (let dy = -r; dy <= r; dy++) {
+        for (let dx = -r; dx <= r; dx++) {
+          if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue;
+          const tx = start.tx + dx, ty = start.ty + dy;
+          if (!this.map.isWalkable(tx, ty)) continue;
+          const p = this.map.tileToWorld(tx, ty);
+          if (this.units.some(u => u.alive && Phaser.Math.Distance.Between(u.x, u.y, p.x, p.y) < u.radius + 16)) continue;
+          return p;
+        }
+      }
+    }
+    const fallback = nearestReachableWalkable(this.map, start, start, 12);
+    return fallback ? this.map.tileToWorld(fallback.tx, fallback.ty) : null;
+  }
+
+  private updateProjectiles(dt: number): void {
+    for (const p of this.projectiles) {
+      p.update(dt);
+      const tile = this.map.worldToTile(p.x, p.y);
+      p.setVisible(p.side === SIDE.player || this.fog.isVisible(tile.tx, tile.ty));
+    }
+    this.projectiles = this.projectiles.filter(p => p.alive);
+  }
+
+  private spawnProjectile(from: Unit, to: IEntity, damage: number, splashRadius: number): void {
+    const key = from.isSiege() ? 'projectile_stone' : 'projectile_arrow';
+    this.projectiles.push(new Projectile(this, from.x, from.y, to, from.side, damage, splashRadius, key, from));
+  }
+
+  private spawnProjectileFromBuilding(from: Building, to: IEntity): void {
+    this.projectiles.push(new Projectile(this, from.x, from.y - from.radius * 0.5, to, from.side, from.attack, 0, 'projectile_tower', from));
+  }
+
+  resolveProjectileHit(p: Projectile): void {
+    if (!p.target.alive) return;
+    const x = p.target.x, y = p.target.y;
+    const hitVisible = this.isVisibleEntity(p.target);
+    if (p.splashRadius > 0) {
+      const targets = this.findSplashTargets(p.target, p.side, p.splashRadius);
+      for (const target of targets) {
+        const d = Phaser.Math.Distance.Between(x, y, target.x, target.y);
+        const falloff = target === p.target ? 1 : Phaser.Math.Clamp(1 - d / (p.splashRadius * 1.25), 0.35, 0.65);
+        const bonus = target.kind === 'building' && target === p.target ? UNIT.catapult.bonusVsBuilding : 0;
+        this.dealDamage(target, Math.round((p.damage + bonus) * falloff), p.source, hitVisible);
+      }
+      if (hitVisible) this.effects.explosion(x, y);
+    } else {
+      this.dealDamage(p.target, p.damage, p.source, hitVisible);
+      if (hitVisible) this.effects.projectileImpact(x, y, p.target.kind === 'building', x - p.x, y - p.y);
+    }
+  }
+
+  private findSplashTargets(primary: IEntity, sourceSide: Side, radius: number): IEntity[] {
+    const out: IEntity[] = [primary];
+    for (const u of this.queryUnitsInRadius(primary.x, primary.y, radius)) {
+      if (!u.alive || u === primary || u.side === sourceSide || u.side === SIDE.neutral) continue;
+      if (Phaser.Math.Distance.Between(primary.x, primary.y, u.x, u.y) <= radius) out.push(u);
+    }
+    for (const b of this.buildings) {
+      if (!b.alive || b === primary || b.side === sourceSide) continue;
+      if (Phaser.Math.Distance.Between(primary.x, primary.y, b.x, b.y) <= radius + b.radius * 0.4) out.push(b);
+    }
+    return out;
+  }
+
+  private dealDamage(target: IEntity, amount: number, from?: IEntity, show = true): void {
+    if (!target.alive || amount <= 0) return;
+    if (this.testMode && from?.side === SIDE.player && target.side !== SIDE.player) {
+      amount = Math.max(amount, 99999);
+    }
+    const wasAlive = target.alive;
+    const wasBuilding = target.kind === 'building';
+    const wasCaravan = target.kind === 'caravan';
+    target.takeDamage(amount, from);
+    if (target.alive && target.kind === 'unit' && from && from.alive && from.side !== target.side) {
+      const vic = target as Unit;
+      if (vic.canAttack() && (vic.state === 'idle' || vic.state === 'move' || vic.state === 'gather' || vic.state === 'return_cargo' || vic.state === 'build')) {
+        this.assignAttackTarget(vic, from);
+      }
+      this.alertNearbyAllies(vic, from);
+    }
+    if (show) {
+      this.effects.hitFlash(target);
+      this.effects.damageText(target.x, target.y, amount, amount >= 30);
+      // Melee contact impact — only for melee (not spawned by projectile)
+      if (from && from.kind === 'unit' && !(from as Unit).isRanged()) {
+        this.effects.meleeImpact(target.x, target.y, wasBuilding, target.x - from.x, target.y - from.y);
+      }
+      this.audio.play('impact', 0.55, target.x);
+    }
+    if (from && target.side === SIDE.player && from.side === SIDE.ai) this.reportUnderAttack(target);
+    if (wasAlive && !target.alive) {
+      if (this.mode === 'skirmish' && target.kind === 'unit') {
+        if (target.side === SIDE.player) this.skirmishStats.unitsLost++;
+        else if (target.side === SIDE.ai && from?.side === SIDE.player) this.skirmishStats.unitsKilled++;
+      }
+      if (target.kind === 'unit') {
+        const unit = target as Unit;
+        this.emitStoryEvent({ type: 'unitKilled', unitId: unit.id, unitKind: unit.unitKind, side: unit.side, bySide: from?.side });
+      } else if (target.kind === 'building') {
+        const building = target as Building;
+        this.emitStoryEvent({
+          type: 'buildingDestroyed',
+          buildingId: building.id,
+          buildingKind: building.buildingKind,
+          side: building.side,
+          bySide: from?.side
+        });
+      } else if (target.kind === 'caravan') {
+        this.emitStoryEvent({ type: 'caravanResolved', caravanId: target.id, outcome: 'destroyed', bySide: from?.side });
+      }
+      if (wasCaravan) this.grantCaravanLoot(target as Caravan, from, show);
+      if (target.kind === 'animal') this.onAnimalKilled(target as Animal, show);
+      if (show) {
+        if (wasBuilding) {
+          this.effects.buildingDestroyed(target.x, target.y, RACE_COLOR[(target as Building).race]);
+        } else {
+          this.effects.deathPuff(target.x, target.y, target.side);
+        }
+        this.audio.play('death', 0.7, target.x);
+      }
+    }
+    // зграя мститься: вдарив вовка чи лігво — сусідні вовки йдуть на кривдника
+    if (target.kind === 'animal' && target.alive && from && from.side !== SIDE.neutral) {
+      const victim = target as Animal;
+      if (ANIMAL[victim.animalKind].predator || victim.animalKind === 'wolf_den') {
+        for (const a of this.animals) {
+          if (!a.alive || !ANIMAL[a.animalKind].predator) continue;
+          if (Phaser.Math.Distance.Between(a.x, a.y, victim.x, victim.y) <= ANIMAL.packAssistRange) {
+            a.huntTarget = from;
+          }
+        }
+      }
+    }
+  }
+
+  private grantCaravanLoot(caravan: Caravan, from?: IEntity, show = true): void {
+    const side = from?.side;
+    if (side !== SIDE.player && side !== SIDE.ai) return;
+    const reward = CARAVAN_CONFIG.reward;
+    this.economy.deposit(side, 'gold', reward.gold);
+    this.economy.deposit(side, 'salt', reward.salt);
+    if (this.mode === 'skirmish' && side === SIDE.player) this.skirmishStats.caravansLooted++;
+    if (!show) return;
+    this.effects.resourceText(caravan.x, caravan.y - 4, `+${reward.gold} З`, 'gold');
+    this.effects.resourceText(caravan.x, caravan.y + 14, `+${reward.salt} С`, 'salt');
+    this.effects.fx.goldPop(caravan.x - 10, caravan.y - 10);
+    this.effects.fx.lumberChips(caravan.x + 12, caravan.y + 4);
+    this.effects.fx.debrisBurst(caravan.x, caravan.y + 8);
+    this.effects.fx.dustPuff(caravan.x, caravan.y + caravan.radius * 0.45, false);
+    if (side === SIDE.player) this.audio.play('deposit', 0.5, caravan.x);
+  }
+
+  private reportUnderAttack(target: IEntity): void {
+    if (this.time.now - this.lastUnderAttackMs < 2800) return;
+    this.lastUnderAttackMs = this.time.now;
+    this.flashMessage('Наши войска под атакой!');
+    this.effects.alertPulse(target.x, target.y);
+    this.audio.play('alert');
+  }
+
+  private combatTick(): void {
+    for (const u of this.units) {
+      if (!u.alive || u.state !== 'idle' || !u.canAttack()) continue;
+      const t = this.acquireTarget(u, u.sight * TILE * 0.85);
+      if (t) this.assignAttackTarget(u, t);
+    }
+  }
+
+  private updateFog(): void {
+    const startedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    this.fog.dimVisible();
+    const revealedUnitTiles = new Set<number>();
+    for (const u of this.units) {
+      if (!u.alive || u.side !== SIDE.player) continue;
+      const { tx, ty } = this.map.worldToTile(u.x, u.y);
+      const key = ty * this.map.w + tx;
+      if (revealedUnitTiles.has(key)) continue;
+      revealedUnitTiles.add(key);
+      this.fog.revealCircle(tx, ty, u.sight);
+    }
+    for (const b of this.buildings) {
+      if (!b.alive || b.side !== SIDE.player) continue;
+      const c = b.centerTile();
+      this.fog.revealCircle(c.tx, c.ty, b.sight);
+    }
+    this.applyStoryReveals();
+    this.fog.redraw();
+    this.applyVisibility();
+    const elapsed = Math.max(0, (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt);
+    this.fogLastMs = elapsed;
+    this.fogAvgMs = this.fogAvgMs === 0 ? elapsed : this.fogAvgMs * 0.9 + elapsed * 0.1;
+  }
+
+  private initialReveal(): void {
+    for (const b of this.buildings) {
+      if (b.side !== SIDE.player) continue;
+      const c = b.centerTile();
+      this.fog.revealCircle(c.tx, c.ty, b.sight);
+    }
+    for (const u of this.units) {
+      if (u.side !== SIDE.player) continue;
+      const { tx, ty } = this.map.worldToTile(u.x, u.y);
+      this.fog.revealCircle(tx, ty, u.sight);
+    }
+  }
+
+  private applyVisibility(): void {
+    for (const u of this.units) {
+      if (!u.alive) continue;
+      const { tx, ty } = this.map.worldToTile(u.x, u.y);
+      const visible = u.side === SIDE.player || this.fog.isVisible(tx, ty);
+      u.sprite.setVisible(visible);
+      u.hb.setVisible(visible);
+    }
+    for (const b of this.buildings) {
+      if (!b.alive) continue;
+      const c = b.centerTile();
+      const explored = b.side === SIDE.player || this.fog.isExplored(c.tx, c.ty);
+      const visible = b.side === SIDE.player || this.fog.isVisible(c.tx, c.ty);
+      b.setVisible(explored);
+      b.hb.setVisible(visible);
+    }
+    for (const r of this.resources) {
+      if (!r.alive) continue;
+      const { tx, ty } = this.map.worldToTile(r.x, r.y);
+      const explored = this.fog.isExplored(tx, ty);
+      r.sprite.setVisible(explored);
+      r.hb.setVisible(explored);
+    }
+    for (const a of this.animals) {
+      if (a.alive) a.setVisible(this.isVisibleEntity(a));
+    }
+    for (const c of this.caravans) {
+      if (!c.alive) continue;
+      const { tx, ty } = this.map.worldToTile(c.x, c.y);
+      c.setVisible(this.fog.isVisible(tx, ty));
+    }
+  }
+
+  private isVisibleEntity(e: IEntity): boolean {
+    if (e.side === SIDE.player) return true;
+    const { tx, ty } = this.map.worldToTile(e.x, e.y);
+    return this.fog.isVisible(tx, ty);
+  }
+
+  private pruneDead(): void {
+    const deadUnits = this.units.filter(u => !u.alive);
+    if (deadUnits.length > 0) {
+      const deadUnitIds = new Set(deadUnits.map(u => u.id));
+      for (const u of deadUnits) this.economy.removePop(u.side, u.food);
+      this.units = this.units.filter(u => u.alive);
+
+      let selectionChanged = false;
+      const selectedCount = this.selected.length;
+      this.selected = this.selected.filter(u => u.alive);
+      if (this.selected.length !== selectedCount) selectionChanged = true;
+
+      for (const key of Object.keys(this.controlGroups)) {
+        const groupId = Number(key);
+        const group = this.controlGroups[groupId];
+        const aliveGroup = group.filter(u => u.alive);
+        if (aliveGroup.length > 0) this.controlGroups[groupId] = aliveGroup;
+        else delete this.controlGroups[groupId];
+      }
+
+      for (const u of this.units) {
+        if (u.targetUnit && deadUnitIds.has(u.targetUnit.id)) u.targetUnit = null;
+      }
+
+      for (const r of this.selectionRings) {
+        const u = r.getData('follow') as Unit | undefined;
+        if (!u || deadUnitIds.has(u.id) || !u.alive) r.destroy();
+      }
+      this.selectionRings = this.selectionRings.filter(r => r.active);
+
+      if (selectionChanged) this.game.events.emit('selection-changed', { units: this.selected, building: this.selectedBuilding });
+    }
+
+    const deadCaravans = this.caravans.filter(c => !c.alive);
+    if (deadCaravans.length > 0) {
+      const deadCaravanIds = new Set(deadCaravans.map(c => c.id));
+      this.caravans = this.caravans.filter(c => c.alive);
+      for (const u of this.units) {
+        if (u.targetUnit && deadCaravanIds.has(u.targetUnit.id)) u.targetUnit = null;
+      }
+    }
+
+    this.buildings = this.buildings.filter(b => {
+      if (!b.alive) {
+        const def = BUILDING[b.buildingKind];
+        if ((b.buildingKind === 'townhall' || b.buildingKind === 'farm') && b.completed) this.economy.removeCap(b.side, def.food);
+        for (let dy = 0; dy < b.sizeTiles; dy++) for (let dx = 0; dx < b.sizeTiles; dx++) this.map.setWalkable(b.tx + dx, b.ty + dy, true);
+        return false;
+      }
+      return true;
+    });
+    this.resources = this.resources.filter(r => r.alive);
+
+    if (this.hoveredEntity && !this.hoveredEntity.alive) this.emitEntityHover(null);
+  }
+
+  private checkVictory(): void {
+    if (this.mode !== 'skirmish') return;
+    if (SKIRMISH_CONFIG.rules.elimination !== 'allBuildings') return;
+    const playerHasBuildings = this.buildings.some(b => b.alive && b.side === SIDE.player);
+    const aiHasBuildings = this.buildings.some(b => b.alive && b.side === SIDE.ai);
+    if (!playerHasBuildings && !aiHasBuildings) this.endGame(false);
+    else if (!aiHasBuildings) this.endGame(true);
+    else if (!playerHasBuildings) this.endGame(false);
+  }
+
+  private endGame(win: boolean): void {
+    if (this.gameOver) return;
+    this.gameOver = true;
+    const payload: GameOverPayload = { win, summary: this.createSkirmishSummary() };
+    const color = win ? 0x44ff88 : 0xff4444;
+    const mid = this.cameras.main.midPoint;
+    this.effects.shockwave(mid.x, mid.y, color);
+    this.cameras.main.flash(500, (color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff);
+    this.cameras.main.shake(700, 0.012);
+    this.audio.play(win ? 'victory' : 'defeat', 1);
+    this.tweens.timeScale = 0.35;
+    window.setTimeout(() => {
+      this.tweens.timeScale = 1;
+      this.game.events.emit('game-over', payload);
+    }, 1400);
+  }
+
+  private createSkirmishSummary(): SkirmishSummary {
+    return {
+      durationMs: Math.max(0, this.time.now - this.skirmishStats.startedAtMs),
+      unitsKilled: this.skirmishStats.unitsKilled,
+      unitsLost: this.skirmishStats.unitsLost,
+      resourcesGathered: { ...this.skirmishStats.resourcesGathered },
+      caravansLooted: this.skirmishStats.caravansLooted
+    };
+  }
+
+  private flashMessage(text: string): void {
+    this.game.events.emit('flash-message', text);
+  }
+
+  private drawRally(): void {
+    this.rallyGraphics.clear();
+    const b = this.selectedBuilding;
+    if (!b || !b.rally || !b.completed) return;
+    this.rallyGraphics.lineStyle(2, 0xffffff, 0.55);
+    this.rallyGraphics.lineBetween(b.x, b.y, b.rally.x, b.rally.y);
+    this.rallyGraphics.fillStyle(RACE_COLOR[b.race], 1);
+    this.rallyGraphics.fillTriangle(b.rally.x, b.rally.y - 16, b.rally.x + 12, b.rally.y - 10, b.rally.x, b.rally.y - 4);
+    this.rallyGraphics.lineStyle(2, 0x111111, 1);
+    this.rallyGraphics.lineBetween(b.rally.x, b.rally.y - 16, b.rally.x, b.rally.y + 12);
+  }
+}
+
+class Projectile {
+  sprite: Phaser.GameObjects.Sprite;
+  alive = true;
+  speed: number;
+  private trailMs = 0;
+  private trailKind: 'arrow' | 'siege' | 'magic';
+
+  constructor(
+    private scene: GameScene,
+    x: number,
+    y: number,
+    public target: IEntity,
+    public side: Side,
+    public damage: number,
+    public splashRadius: number,
+    texture: string,
+    public source?: IEntity
+  ) {
+    this.sprite = scene.add.sprite(x, y, texture).setDepth(40);
+    const display = PROJECTILE_DISPLAY[texture];
+    if (display) this.sprite.setDisplaySize(display.width, display.height);
+    this.speed = splashRadius > 0 ? 280 : 430;
+    this.trailKind = splashRadius > 0 ? 'siege' : texture === 'projectile_tower' ? 'magic' : 'arrow';
+  }
+
+  get x(): number { return this.sprite.x; }
+  get y(): number { return this.sprite.y; }
+
+  update(dt: number): void {
+    if (!this.alive) return;
+    if (!this.target.alive) { this.destroy(); return; }
+    const dx = this.target.x - this.sprite.x;
+    const dy = this.target.y - this.sprite.y;
+    const d = Math.hypot(dx, dy);
+    const step = (this.speed * dt) / 1000;
+    this.trailMs += dt;
+    if (this.trailMs > VISUALS.projectileTrailMs && this.sprite.visible) {
+      this.trailMs = 0;
+      this.scene.effects.projectileTrail(this.sprite.x, this.sprite.y, this.sprite.rotation, this.trailKind);
+    }
+    if (d <= step + 3) {
+      this.scene.resolveProjectileHit(this);
+      this.destroy();
+      return;
+    }
+    this.sprite.x += (dx / d) * step;
+    this.sprite.y += (dy / d) * step;
+    this.sprite.rotation = Math.atan2(dy, dx);
+  }
+
+  setVisible(v: boolean): void { this.sprite.setVisible(v); }
+
+  destroy(): void {
+    if (!this.alive) return;
+    this.sprite.destroy();
+    this.alive = false;
+  }
+}
